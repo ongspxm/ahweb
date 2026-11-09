@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AhWeb</title>
+  <link id="favicon" rel="icon" type="image/svg+xml">
+  <script>
+    fetch('/host').then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.text()}).then(host=>{
+      const code=String([...host].reduce((sum,c)=>sum+c.codePointAt(0),0)%99).padStart(2,'0'), color=['#75c987','#ef7777','#f3cf62','#7fa0f5'][Number(code)%4];
+      const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="${color}"/><text x="32" y="44" fill="black" font-family="sans-serif" font-size="36" font-weight="700" text-anchor="middle">${code}</text></svg>`, svgUrl=`data:image/svg+xml,${encodeURIComponent(svg)}`;
+      document.getElementById('favicon').href=svgUrl;
+      const setBrand=()=>{const icon=document.getElementById('brand-icon');if(icon)icon.src=svgUrl;};
+      if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',setBrand,{once:true});else setBrand();
+    }).catch(error=>console.error('favicon.host failed',error));
+  </script>
+  <link rel="stylesheet" href="/lib/pico/pico.min.css">
+  <script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}</script>
+  <script src="/lib/htmx/htmx.min.js"></script>
+  <script src="/lib/lucide/lucide.min.js"></script>
+  <link rel="stylesheet" href="/lib/xterm/xterm.css">
+  <link rel="stylesheet" href="/lib/driver/driver.css">
+  <link rel="stylesheet" href="/lib/driver/checklist.css">
+  <script src="/lib/driver/driver.js.iife.js"></script>
+  <script src="/lib/driver/checklist.iife.js"></script>
+  <style>
+    /* Base and shared helpers */
+    :root { font-size: 14px; }
+    body { margin: 0; overflow: hidden; }
+    #panel-sessions, #panel-workspace, #panel-chats { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    #panel-sessions { gap: .5rem; padding: 1rem; }
+    #panel-chats { overflow: hidden; }
+    .project-row, .worktree-row { display: flex; align-items: center; gap: .5rem; }
+    .project-row > button:first-child, .worktree-row button { flex: 1; min-width: 0; margin-bottom: 0; }
+    .project-remove { display: grid; place-items: center; width: 1.1rem; height: 1.1rem; flex: 0 0 auto; margin: 0; padding: 0; border-radius: 50%; }
+    .project-remove svg { width: .7rem; height: .7rem; }
+    .status { display: inline-block; width: .55rem; height: .55rem; flex: 0 0 auto; margin-left: auto; border: 1px solid var(--pico-mark-color); border-radius: 50%; background: var(--pico-mark-background-color); }
+    .status.busy { animation: pulse .5s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .25; } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Sessions */
+    .title-row, #prompt-controls { display: flex; justify-content: space-between; align-items: center; gap: .5rem; }
+    .title-row > div { display: flex; gap: .4rem; }
+    #theme, #add-project, #layout-toggle, #actions-toggle, #hotkey-hints-toggle { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0; padding: 0; }
+    body.show-hotkeys [data-hotkey] { position: relative; }
+    body.show-hotkeys [data-hotkey]::after { position: absolute; z-index: 5; top: .05rem; right: .05rem; min-width: 1.35rem; padding: .2rem .35rem; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); background: var(--pico-card-background-color); color: var(--pico-h1-color); content: attr(data-hotkey); font-size: .85rem; font-weight: 600; line-height: 1.2; text-align: center; white-space: nowrap; pointer-events: none; }
+    body.show-hotkeys [data-hotkey^="("]::after { font-size: .8rem; }
+    #hotkey-hints-legend { display: none; margin: 0; color: var(--pico-muted-color); font-size: .8rem; }
+    body.show-hotkeys #hotkey-hints-legend { display: block; }
+    #notice-area { margin: .35rem 0; }
+    #notice-area[hidden] { display: none; }
+    #notice-list { display: grid; gap: .35rem; }
+    #notice-list article { display: flex; justify-content: space-between; align-items: center; gap: .5rem; margin: 0; padding: .4rem .55rem; }
+    #notice-list .error { border-left: .2rem solid var(--pico-del-color); }
+    .title-row > div:last-child svg { width: 1rem; height: 1rem; }
+    #brand-icon { width: 2rem; height: 2rem; }
+    #brand-palette { width: auto; height: 2rem; flex: 0 0 auto; }
+    #panel-sessions button, #project-browser button { text-align: left; }
+    .side-section { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; margin: 0; padding: .4rem .6rem; overflow-y: scroll; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); }
+    .side-section:not([open]) { flex: 0 0 auto; }
+    .side-section > summary { flex: 0 0 auto; margin: 0; cursor: pointer; font-weight: 600; }
+    .section-content { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: .35rem; overflow-y: auto; overflow-wrap: anywhere; padding-top: .35rem; }
+    #session-folder { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #chats-list { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: .35rem; overflow-x: hidden; overflow-y: auto; }
+    #chats-list button { display: flex; align-items: center; gap: .4rem; margin: 0; text-align: left; }
+    #chats-list .session-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #chats-list details { margin: 0; padding: 0; }
+    #chats-list summary { margin: 0; padding: .25rem; color: var(--pico-muted-color); }
+    #chats-list .session-child { padding-left: .75rem; }
+    #chats-list .session-row { display: flex; align-items: center; gap: .5rem; }
+    #chats-list .session-row > button { flex: 1; min-width: 0; margin: 0; }
+    #chats-list .session-child button { width: 100%; }
+
+    /* Status */
+    #server-status { padding: .75rem; }
+    #server-status > p { margin: 0 0 .35rem; }
+    #server-status h3 { margin: .75rem 0 .35rem; }
+    .status-harnesses { display: grid; gap: .15rem; }
+    .status-harness-row { display: flex; align-items: center; gap: .45rem; min-height: 1.4rem; }
+    .status-harness-row svg { width: .9rem; height: .9rem; flex: 0 0 auto; }
+    .status-harness-row strong { min-width: 6rem; }
+    .status-ok { color: var(--pico-ins-color); }
+    .status-error, .status-project-error { color: var(--pico-del-color); }
+    .status-empty, .status-project-error { margin: .25rem 0; }
+    .status-projects, .status-worktrees { width: 100%; table-layout: fixed; }
+    .status-projects { margin: 0; font-size: .9rem; }
+    .status-projects th, .status-projects td, .status-worktrees th, .status-worktrees td { padding: .35rem .5rem; }
+    .status-projects th:first-child, .status-worktrees th:first-child { width: 70%; }
+    .status-projects th:nth-child(2), .status-projects th:nth-child(3), .status-worktrees th:nth-child(2), .status-worktrees th:nth-child(3) { width: 15%; }
+    .status-project-root { overflow-wrap: anywhere; }
+    .status-project-root details, .status-project-root summary { margin: 0; }
+    .status-project-root summary { display: grid; grid-template-columns: 70% 15% 15%; cursor: pointer; }
+    .status-worktrees { margin: .35rem 0 0; font-size: .9em; }
+    .status-worktrees td { overflow-wrap: anywhere; }
+
+    /* Workspace and files */
+    #workspace-tabs { display: flex; flex: 0 0 auto; justify-content: flex-start; gap: 0; min-height: 3rem; margin-bottom: .5rem; overflow-x: scroll; overflow-y: hidden; border-bottom: 1px solid var(--pico-muted-border-color); }
+    #workspace-tabs #workspace-refresh { align-self: center; width: 2rem; height: 2rem; margin: 0 0 0 auto; padding: 0; }
+    #workspace-refresh svg { width: 1rem; height: 1rem; }
+    #workspace-tabs button { flex: 0 0 auto; width: auto; margin: 0 0 -1px; padding: .5rem .75rem; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--pico-muted-color); }
+    #workspace-tabs button[aria-selected="true"] { border-bottom-color: var(--pico-primary); color: var(--pico-primary); }
+    #workspace-tabs [data-mobile-panel] { display: none; }
+    .workspace-pane { flex: 1; min-height: 0; overflow: auto; border: 1px dashed var(--pico-muted-border-color); border-radius: var(--pico-border-radius); }
+    #files-layout, #git-layout { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+    #git-files, #git-diff { flex: 1; min-height: 0; overflow: auto; }
+    #git-files { border-bottom: 1px solid var(--pico-muted-border-color); }
+    .split-resizer { flex: 0 0 6px; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: row-resize; touch-action: none; }
+    .split-resizer::after { display: block; height: 1px; width: 100%; margin: auto; background: var(--pico-muted-border-color); content: ""; }
+    .split-resizer:hover::after, .split-resizer:focus-visible::after { height: 3px; background: var(--pico-primary); }
+    .git-empty { padding: .9rem; color: var(--pico-muted-color); }
+    .git-entry { display: flex; align-items: center; gap: .7rem; width: 100%; min-height: 3rem; margin: 0; padding: .5rem .9rem; border: 0; border-bottom: 1px solid var(--pico-muted-border-color); border-radius: 0; background: transparent; color: var(--pico-h1-color); text-align: left; }
+    .git-entry:hover, .git-entry[aria-pressed="true"] { background: var(--pico-primary-focus); }
+    .git-entry > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+    .git-status { flex: 0 0 2ch; background: transparent; }
+    .git-status[data-kind="added"] { color: var(--pico-ins-color); }
+    .git-status[data-kind="deleted"] { color: var(--pico-del-color); }
+    .git-status[data-kind="modified"], .git-status[data-kind="renamed"] { color: var(--pico-mark-color); }
+    #git-diff { display: flex; flex-direction: column; gap: .5rem; padding: .5rem; }
+    #git-diff > strong { flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .git-diff-text { min-width: max-content; margin: 0; padding: .25rem; overflow: auto; }
+    .git-diff-line { display: block; min-height: 1lh; }
+    .git-diff-line.added { color: var(--pico-ins-color); background: color-mix(in srgb, var(--pico-ins-color) 10%, transparent); }
+    .git-diff-line.deleted { color: var(--pico-del-color); background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); }
+    #tab-cli:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
+    #cli-terminal { flex: 1; min-width: 0; min-height: 0; padding: .5rem; background: #000; }
+    #cli-keys { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: .25rem; padding: .35rem .35rem 0; margin: 0; }
+    #cli-hint { align-self: center; color: var(--pico-muted-color); font-size: .75rem; }
+    #cli-keys button { margin: 0; }
+    #cli-keys > div { display: contents; }
+    #cli-keys button:not([data-font-size]) { display: none; }
+    #file-list, #file-view { flex: 1; min-height: 0; overflow: auto; }
+    #file-list { padding: 0; border-bottom: 1px solid var(--pico-muted-border-color); color: var(--pico-color); }
+    #file-list .file-list-empty { padding: .9rem; }
+    #file-list details { margin: 0; }
+    #file-list .file-children { padding-left: 1rem; }
+    #file-list summary { display: flex; align-items: center; gap: .45rem; min-height: 3rem; padding: .5rem .9rem; cursor: pointer; border-bottom: 1px solid var(--pico-muted-border-color); border-radius: 0; color: var(--pico-primary-hover); }
+    #file-list summary:hover { background: var(--pico-primary-focus); }
+    #file-list summary i, #file-list .file-entry i { width: 1rem; height: 1rem; flex: 0 0 auto; }
+    #file-list .file-entry { display: flex; align-items: center; gap: .45rem; width: 100%; min-height: 3rem; margin: 0; padding: .5rem .9rem; border: 0; border-bottom: 1px solid var(--pico-muted-border-color); border-radius: 0; background: transparent; color: inherit; text-align: left; }
+    #file-list .file-entry:hover, #file-list .file-entry[aria-pressed="true"] { background: var(--pico-primary-focus); }
+    #file-list .file-entry[aria-pressed="true"] { color: inherit; }
+    #file-view { display: flex; flex-direction: column; gap: .75rem; padding: .5rem; }
+    #file-view > strong { flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #file-view img, #file-view video, #file-view iframe { display: block; width: 100%; height: 100%; min-height: 12rem; border: 0; object-fit: contain; }
+    #file-view audio { width: 100%; }
+    .file-empty { display: grid; flex: 1; place-content: center; justify-items: center; gap: .5rem; color: var(--pico-muted-color); text-align: center; }
+    .file-empty i { width: 1.5rem; height: 1.5rem; }
+    .file-text { counter-reset: line; min-width: max-content; margin: 0; padding: .25rem; overflow: auto; }
+    .file-line { counter-increment: line; display: grid; grid-template-columns: 3rem max-content; gap: .75rem; min-height: 1lh; }
+    .file-line::before { content: counter(line); color: var(--pico-muted-color); text-align: right; user-select: none; }
+
+    /* Chat and prompt */
+    #messages { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: .5rem; padding: 1rem; overflow-y: auto; overscroll-behavior-y: contain; }
+    #messages article { margin-bottom: 0; }
+    #messages .row { display: flex; align-items: center; gap: .5rem; }
+    #messages .thinking div, #messages article.you div { white-space: pre-wrap; }
+    #messages article.thinking, #messages article.events { padding: .25rem .5rem; }
+    #messages .tool .t.success, #messages .tool .t.success strong { color: var(--pico-ins-color); }
+    #messages .tool .t.failed, #messages .tool .t.failed strong { color: var(--pico-del-color); }
+    #messages .tool .t .tool-detail { color: var(--pico-muted-color); }
+    #messages .chat-image { display: block; max-width: min(100%, 40rem); max-height: 32rem; margin: .5rem 0 0; border-radius: var(--pico-border-radius); object-fit: contain; }
+    #messages article.you { background-color: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+    #messages article.you header, #messages article.you strong, #messages article.you small { color: inherit; background-color: inherit; }
+    #messages article.error { background-color: color-mix(in srgb, var(--pico-del-color) 10%, var(--pico-card-background-color)); }
+    #messages article.error header, #messages article.error strong { color: var(--pico-del-color); }
+    #queued-prompts { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #image-preview { display: flex; flex-wrap: wrap; gap: .5rem; margin: .5rem 0; }
+    .image-preview-item { position: relative; }
+    .image-preview-item img { display: block; width: 5rem; height: 5rem; border-radius: var(--pico-border-radius); object-fit: cover; }
+    .image-preview-item button { position: absolute; top: 0; right: 0; width: 1.5rem; height: 1.5rem; margin: 0; padding: 0; line-height: 1; }
+    #prompt-images { display: none; }
+    footer { border-top: 1px solid var(--pico-muted-border-color); }
+    #prompt-form { margin-bottom: 0; }
+    #prompt { min-height: 1.5lh; height: auto; max-height: 10lh; overflow-y: auto; resize: none; }
+    #prompt-controls { flex-wrap: wrap; margin-top: .5rem; }
+    #harness { width: auto; min-width: 7rem; margin: 0; }
+    #model { flex: 1; min-width: 8rem; margin: 0; }
+    #reasoning { width: auto; min-width: 9rem; margin: 0; }
+    #prompt-actions { display: flex; flex: 1 0 100%; justify-content: flex-end; flex-wrap: nowrap; gap: .5rem; }
+    #prompt-actions button { flex: 0 0 auto; width: auto; margin: 0; }
+    #add-project svg, #theme svg, #layout-toggle svg, #actions-toggle svg, #hotkey-hints-toggle svg, #actions-close svg, #prompt-actions svg { width: 1rem; height: 1rem; }
+    #actions-dialog header { display: flex; justify-content: space-between; align-items: center; }
+    #actions-close { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0; padding: 0; }
+    #actions-dialog article { max-height: 80vh; overflow-y: auto; }
+    #actions-dialog .action-row { display: flex; justify-content: space-between; gap: 2rem; width: 100%; margin: 0; padding: .4rem; text-align: left; }
+    #actions-dialog .action-row small { color: var(--pico-muted-color); }
+    #send:disabled svg, #stop:disabled svg { animation: spin 1s linear infinite; }
+    #stats-bar { display: flex; align-items: center; flex-direction: row-reverse; }
+
+    /* Desktop layout */
+    @media (min-width: 601px) {
+      body { display: grid; grid-template-columns: minmax(0, var(--sessions-width, 20rem)) 6px minmax(0, 1fr) 6px minmax(0, var(--chats-width, 30rem)); grid-template-rows: minmax(0, 1fr); height: 100vh; }
+      #panel-sessions, #panel-workspace, #panel-chats, .panel-resizer { grid-row: 1; }
+      #panel-sessions { grid-column: 1; border-right: 1px solid var(--pico-muted-border-color); container-type: inline-size; }
+      #panel-workspace { grid-column: 3; border-right: 1px solid var(--pico-muted-border-color); container-type: inline-size; }
+      #panel-chats { grid-column: 5; container-type: inline-size; }
+      body > .panel-resizer:first-of-type { grid-column: 2; }
+      body > .panel-resizer:last-of-type { grid-column: 4; }
+      body.chat_first { grid-template-columns: minmax(0, var(--chats-width, 30rem)) 6px minmax(0, 1fr) 6px minmax(0, var(--sessions-width, 20rem)); }
+      body.chat_first #panel-chats { grid-column: 1; }
+      body.chat_first #panel-sessions { grid-column: 5; border-right: 0; }
+      body.chat_first #panel-workspace { border-left: 1px solid var(--pico-muted-border-color); }
+      @container (width < 10rem) { #panel-sessions > *, #panel-workspace > *, #panel-chats > * { visibility: hidden; } }
+      .panel-resizer { width: 6px; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: col-resize; touch-action: none; }
+      .panel-resizer::after { display: block; width: 1px; height: 100%; margin: auto; background: var(--pico-muted-border-color); content: ""; }
+      .panel-resizer:hover::after, .panel-resizer:focus-visible::after { width: 3px; background: var(--pico-primary); }
+    }
+
+    /* Mobile layout */
+    @media (max-width: 600px) {
+      body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: var(--app-height, 100dvh); }
+      .panel-resizer, #layout-toggle { display: none; }
+      #panel-workspace { display: contents; }
+      #workspace-tabs { grid-column: 1; grid-row: 1; min-width: 0; margin: 0; padding-inline: .5rem; }
+      #workspace-tabs [data-mobile-panel] { display: block; }
+      #panel-sessions, #panel-chats, .workspace-pane { grid-column: 1; grid-row: 2; min-height: 0; }
+      #panel-sessions, #panel-workspace, #panel-chats { container-type: normal; }
+      #panel-sessions { padding: .75rem; }
+      #panel-workspace { padding: 0; border: 0; }
+      #panel-chats { padding-bottom: env(safe-area-inset-bottom); }
+      body[data-mobile-panel="sessions"] #panel-chats, body[data-mobile-panel="sessions"] .workspace-pane,
+      body[data-mobile-panel="chats"] #panel-sessions, body[data-mobile-panel="chats"] .workspace-pane,
+      body[data-mobile-panel^="tab-"] #panel-sessions, body[data-mobile-panel^="tab-"] #panel-chats { display: none; }
+      body[data-mobile-panel^="tab-"] .workspace-pane:not([hidden]) { display: block; }
+      #cli-keys { display: grid; flex: 0 0 auto; grid-template-rows: auto repeat(2, 2.5rem); gap: .25rem; padding: .35rem; padding-bottom: calc(.35rem + env(safe-area-inset-bottom)); }
+      #cli-hint { grid-column: 1 / -1; }
+      #cli-keys > div { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: .25rem; }
+      #cli-keys button { height: 2.5rem; min-width: 0; margin: 0; padding: .1rem .25rem; font-size: .85rem; }
+      #cli-keys button:not([data-font-size]) { display: revert; }
+      #cli-keys button[aria-pressed="true"] { border: 2px solid var(--pico-primary-inverse); background: var(--pico-primary); box-shadow: 0 0 0 2px var(--pico-primary); color: var(--pico-primary-inverse); }
+      #prompt-controls { align-items: center; flex-wrap: wrap; }
+      #prompt-actions { margin-left: auto; }
+    }
+  </style>
+</head>
+<body class="chat_first">
+  <script>try { document.body.classList.toggle("chat_first", localStorage.getItem("chat_first") !== "false"); } catch {}</script>
+  <aside id="panel-sessions">
+    <div class="title-row">
+      <div>
+        <svg id="brand-palette" viewBox="0 0 16 50" aria-hidden="true"><path fill="#75c987" d="M0 0h16v12.5H0z"/><path fill="#ef7777" d="M0 12.5h16V25H0z"/><path fill="#f3cf62" d="M0 25h16v12.5H0z"/><path fill="#7fa0f5" d="M0 37.5h16V50H0z"/></svg>
+        <img id="brand-icon" alt="Site icon">
+      </div>
+      <div>
+        <button id="add-project" class="outline secondary" type="button" aria-label="Add project" title="Add project"><i data-lucide="folder-plus"></i></button>
+        <button id="layout-toggle" class="outline secondary" type="button" aria-label="Swap panel layout" title="Swap panel layout"><i data-lucide="arrow-left-right"></i></button>
+        <button id="theme" class="outline secondary" type="button" aria-label="Switch theme"><i data-lucide="moon"></i></button>
+        <button id="actions-toggle" class="outline secondary" type="button" aria-label="Actions" title="Actions"><i data-lucide="settings"></i></button>
+        <button id="hotkey-hints-toggle" class="outline secondary" type="button" aria-label="Show hotkey hints" title="Show hotkey hints" aria-pressed="false"><i data-lucide="circle-help"></i></button>
+      </div>
+    </div>
+    <small id="hotkey-hints-legend" hidden></small>
+    <section id="notice-area" aria-label="Notices" hidden>
+      <div id="notice-list" aria-live="polite"></div>
+    </section>
+    <details id="projects-panel" class="side-section" open>
+      <summary>Projects</summary>
+      <div class="section-content" id="projects-list" aria-label="Projects"></div>
+    </details>
+    <details id="worktrees-panel" class="side-section" open>
+      <summary>Worktrees</summary>
+      <div class="section-content" id="worktrees-list" aria-label="Worktrees"></div>
+    </details>
+    <details id="chats-panel" class="side-section" open>
+      <summary>Chats <small id="session-count"></small><small id="session-folder"></small></summary>
+      <div class="section-content">
+        <div id="chats-list" aria-label="Chats" hx-trigger="refresh" hx-swap="none"></div>
+      </div>
+    </details>
+    <input id="directory" type="hidden" value="">
+  </aside>
+  <div class="panel-resizer" role="separator" aria-orientation="vertical" tabindex="0"></div>
+  <aside id="panel-workspace">
+    <nav id="workspace-tabs" aria-label="Workspace tabs">
+      <button type="button" data-workspace-tab="tab-files" aria-controls="tab-files" aria-selected="false">Files</button>
+      <button type="button" data-workspace-tab="tab-git" aria-controls="tab-git" aria-selected="false">Git</button>
+      <button type="button" data-workspace-tab="tab-cli" aria-controls="tab-cli" aria-selected="false">CLI <span id="cli-status" class="status" role="img" aria-label="CLI connected" hidden></span></button>
+      <button type="button" data-workspace-tab="tab-status" aria-controls="tab-status" aria-selected="false">Status</button>
+      <button id="workspace-refresh" type="button" aria-label="Refresh workspace" title="Refresh workspace"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
+    </nav>
+    <div id="tab-files" class="workspace-pane" role="tabpanel" aria-label="Files" hidden>
+      <div id="files-layout">
+        <div id="file-list" aria-label="Files"></div>
+        <div class="split-resizer" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="Resize file list"></div>
+        <section id="file-view" aria-label="File preview">Select a file to view it</section>
+      </div>
+    </div>
+    <div id="tab-git" class="workspace-pane" role="tabpanel" aria-label="Git" hidden>
+      <div id="git-layout">
+        <div id="git-files" aria-label="Changed files"></div>
+        <div class="split-resizer" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="Resize changed files"></div>
+        <section id="git-diff" aria-label="File diff">Select a changed file to view its diff</section>
+      </div>
+    </div>
+    <div id="tab-status" class="workspace-pane" role="tabpanel" aria-label="Status" hidden>
+      <button id="status-refresh" type="button" class="outline secondary">Refresh status</button>
+      <div id="server-status" aria-live="polite">Loading status…</div>
+    </div>
+    <div id="tab-cli" class="workspace-pane" role="tabpanel" aria-label="CLI" hidden>
+      <div id="cli-terminal"></div>
+      <div id="cli-keys" role="group" aria-label="Terminal keys">
+        <small id="cli-hint">Refresh reconnects the CLI and replays buffered output; the shell keeps running.</small>
+        <div id="cli-btns">
+          <button type="button" data-key="escape">ESC</button>
+          <button type="button" data-key="tab">TAB</button>
+          <button type="button" data-modifier="ctrl" aria-pressed="false">CTRL</button>
+          <button type="button" data-modifier="alt" aria-pressed="false">ALT</button>
+          <button type="button" data-modifier="shift" aria-pressed="false">SHIFT</button>
+          <button type="button" data-key="pageup">PGUP</button>
+          <button type="button" data-font-size="1" aria-label="Increase terminal font size">F+</button>
+        </div>
+        <div>
+          <button type="button" data-key="left" aria-label="Left">←</button>
+          <button type="button" data-key="down" aria-label="Down">↓</button>
+          <button type="button" data-key="up" aria-label="Up">↑</button>
+          <button type="button" data-key="right" aria-label="Right">→</button>
+          <button type="button" data-key="enter" aria-label="Enter">ENTER</button>
+          <button type="button" data-key="pagedown">PGDN</button>
+          <button type="button" data-font-size="-1" aria-label="Decrease terminal font size">F-</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+  <div class="panel-resizer" role="separator" aria-orientation="vertical" tabindex="0"></div>
+  <main id="panel-chats">
+    <div id="messages" aria-live="polite" hx-trigger="refresh" hx-swap="none"></div>
+    <footer>
+      <form id="prompt-form">
+        <blockquote id="queued-prompts" aria-label="Queued messages" hidden></blockquote>
+        <div id="prompt-wrap">
+          <textarea id="prompt" name="prompt" rows="2" autocomplete="off" placeholder="Send prompt"></textarea>
+        </div>
+        <div id="image-preview" aria-label="Attached images" hidden></div>
+        <div id="prompt-controls">
+          <select id="harness" name="harness" aria-label="Harness"></select>
+          <input id="model" name="model" list="model-list" aria-label="Model" placeholder="Default model" autocomplete="off">
+          <datalist id="model-list"></datalist>
+          <select id="reasoning" aria-label="Reasoning level" disabled></select>
+          <div id="prompt-actions">
+            <input id="prompt-images" type="file" accept="image/*" multiple>
+            <button id="add-image" class="secondary" type="button" aria-label="Add images" title="Add images"><i data-lucide="image-plus"></i></button>
+            <button id="send" type="submit" aria-label="Send" title="Send"><i data-lucide="send"></i></button>
+            <button id="refresh" class="secondary" type="button" aria-label="Refresh" title="Refresh"><i data-lucide="refresh-cw"></i></button>
+            <button id="stop" class="secondary" type="button" aria-label="Stop" title="Stop"><i data-lucide="square"></i></button>
+            <button id="collapse-all" class="secondary" type="button" aria-label="Expand all" title="Expand all"><i data-lucide="maximize-2"></i></button>
+          </div>
+        </div>
+        <div id="stats-bar">
+          <small id="usage" aria-live="polite"></small>
+          <span id="chat-status" class="status" role="img" aria-label="Busy" hidden></span>
+        </div>
+      </form>
+    </footer>
+  </main>
+  <dialog id="project-dialog">
+    <article>
+      <header><strong>Add project</strong></header>
+      <label for="project-path">Folder</label>
+      <input id="project-path" type="text" autocomplete="off">
+      <button id="browse-project" class="outline" type="button">Browse folders</button>
+      <div id="project-browser" class="section-content"></div>
+      <footer>
+        <button id="close-project" class="secondary" type="button">Cancel</button>
+        <button id="save-project" type="button">Add project</button>
+      </footer>
+    </article>
+  </dialog>
+  <dialog id="actions-dialog">
+    <article>
+      <header><strong>Actions</strong><button id="actions-close" class="outline secondary" type="button" aria-label="Close actions" title="Close actions"><i data-lucide="x"></i></button></header>
+      <small>Esc to close dialog</small>
+      <div id="actions-list"></div>
+      <footer><label for="hotkey-leader">Leader (press a key combination)</label><input id="hotkey-leader" readonly aria-label="Leader shortcut"></footer>
+    </article>
+  </dialog>
+  <script type="module" src="/app_hotkey.js"></script>
+  <script type="module" src="/app_files.js"></script>
+  <script type="module" src="/app_git.js"></script>
+  <script type="module" src="/app_harness.js"></script>
+  <script type="module" src="/app_status.js"></script>
+  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app_layout.js"></script>
+  <script type="module" src="/app_cli.js"></script>
+  <script type="module" src="/app_tours.js"></script>
+</body>
+</html>
