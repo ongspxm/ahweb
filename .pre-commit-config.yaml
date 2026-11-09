@@ -1,0 +1,22 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: pretty-format-json
+        args: [--autofix]
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: goimports
+        name: goimports
+        entry: goimports -w
+        language: system
+        types: [go]
+  - repo: https://github.com/biomejs/pre-commit
+    rev: v2.2.4
+    hooks:
+      - id: biome-check
+        types_or: [html, javascript, css]
