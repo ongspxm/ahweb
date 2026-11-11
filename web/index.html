@@ -27,6 +27,7 @@
     /* Base and shared helpers */
     :root { font-size: 14px; }
     body { margin: 0; overflow: hidden; }
+    #mobile-breadcrumb { display: none; }
     #panel-sessions, #panel-workspace, #panel-chats { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
     #panel-sessions { gap: .5rem; padding: 1rem; }
     #panel-chats { overflow: hidden; }
@@ -42,7 +43,7 @@
     /* Sessions */
     .title-row, #prompt-controls { display: flex; justify-content: space-between; align-items: center; gap: .5rem; }
     .title-row > div { display: flex; gap: .4rem; }
-    #theme, #add-project, #layout-toggle, #actions-toggle, #hotkey-hints-toggle { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0; padding: 0; }
+    #theme, #add-project, #cleanup-sessions, #layout-toggle, #actions-toggle, #hotkey-hints-toggle { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0; padding: 0; }
     body.show-hotkeys [data-hotkey] { position: relative; }
     body.show-hotkeys [data-hotkey]::after { position: absolute; z-index: 5; top: .05rem; right: .05rem; min-width: 1.35rem; padding: .2rem .35rem; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); background: var(--pico-card-background-color); color: var(--pico-h1-color); content: attr(data-hotkey); font-size: .85rem; font-weight: 600; line-height: 1.2; text-align: center; white-space: nowrap; pointer-events: none; }
     body.show-hotkeys [data-hotkey^="("]::after { font-size: .8rem; }
@@ -122,6 +123,10 @@
     .git-diff-line { display: block; min-height: 1lh; }
     .git-diff-line.added { color: var(--pico-ins-color); background: color-mix(in srgb, var(--pico-ins-color) 10%, transparent); }
     .git-diff-line.deleted { color: var(--pico-del-color); background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); }
+    #messages .mermaid-code { display: flex; flex-direction: column; gap: .35rem; }
+    #messages .mermaid-toggle { align-self: flex-end; width: auto; margin: 0; padding: .2rem .5rem; font-size: 0.75rem; }
+    #messages .mermaid-diagram { overflow-x: auto; }
+    #messages .mermaid-diagram svg { max-width: 100%; }
     #tab-cli:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
     #cli-terminal { flex: 1; min-width: 0; min-height: 0; padding: .5rem; background: #000; }
     #cli-keys { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: .25rem; padding: .35rem .35rem 0; margin: 0; }
@@ -141,7 +146,10 @@
     #file-list .file-entry:hover, #file-list .file-entry[aria-pressed="true"] { background: var(--pico-primary-focus); }
     #file-list .file-entry[aria-pressed="true"] { color: inherit; }
     #file-view { display: flex; flex-direction: column; gap: .75rem; padding: .5rem; }
-    #file-view > strong { flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #file-view .file-title { display: flex; align-items: center; gap: .45rem; flex: 0 0 auto; overflow: hidden; }
+    #file-view .file-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #file-view .file-raw-link { flex: 0 0 auto; color: var(--pico-muted-color); }
+    #file-view .file-raw-link i { width: 1rem; height: 1rem; }
     #file-view img, #file-view video, #file-view iframe { display: block; width: 100%; height: 100%; min-height: 12rem; border: 0; object-fit: contain; }
     #file-view audio { width: 100%; }
     .file-empty { display: grid; flex: 1; place-content: center; justify-items: center; gap: .5rem; color: var(--pico-muted-color); text-align: center; }
@@ -179,7 +187,7 @@
     #reasoning { width: auto; min-width: 9rem; margin: 0; }
     #prompt-actions { display: flex; flex: 1 0 100%; justify-content: flex-end; flex-wrap: nowrap; gap: .5rem; }
     #prompt-actions button { flex: 0 0 auto; width: auto; margin: 0; }
-    #add-project svg, #theme svg, #layout-toggle svg, #actions-toggle svg, #hotkey-hints-toggle svg, #actions-close svg, #prompt-actions svg { width: 1rem; height: 1rem; }
+    #add-project svg, #cleanup-sessions svg, #theme svg, #layout-toggle svg, #actions-toggle svg, #hotkey-hints-toggle svg, #actions-close svg, #prompt-actions svg { width: 1rem; height: 1rem; }
     #actions-dialog header { display: flex; justify-content: space-between; align-items: center; }
     #actions-close { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0; padding: 0; }
     #actions-dialog article { max-height: 80vh; overflow-y: auto; }
@@ -209,12 +217,15 @@
 
     /* Mobile layout */
     @media (max-width: 600px) {
-      body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: var(--app-height, 100dvh); }
+      body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); height: var(--app-height, 100dvh); }
       .panel-resizer, #layout-toggle { display: none; }
       #panel-workspace { display: contents; }
-      #workspace-tabs { grid-column: 1; grid-row: 1; min-width: 0; margin: 0; padding-inline: .5rem; }
+      #mobile-breadcrumb { display: flex; grid-column: 1; grid-row: 1; align-items: center; gap: .5rem; min-width: 0; padding: .35rem .75rem 0; }
+      #mobile-breadcrumb button { min-width: 0; margin: 0; padding: 0; border: 0; background: transparent; color: var(--pico-primary); font-size: .9rem; text-align: left; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; }
+      #mobile-breadcrumb span { flex: 0 0 auto; color: var(--pico-muted-color); }
+      #workspace-tabs { grid-column: 1; grid-row: 2; min-width: 0; margin: 0; padding-inline: .5rem; }
       #workspace-tabs [data-mobile-panel] { display: block; }
-      #panel-sessions, #panel-chats, .workspace-pane { grid-column: 1; grid-row: 2; min-height: 0; }
+      #panel-sessions, #panel-chats, .workspace-pane { grid-column: 1; grid-row: 3; min-height: 0; }
       #panel-sessions, #panel-workspace, #panel-chats { container-type: normal; }
       #panel-sessions { padding: .75rem; }
       #panel-workspace { padding: 0; border: 0; }
@@ -246,6 +257,7 @@
         <button id="add-project" class="outline secondary" type="button" aria-label="Add project" title="Add project"><i data-lucide="folder-plus"></i></button>
         <button id="layout-toggle" class="outline secondary" type="button" aria-label="Swap panel layout" title="Swap panel layout"><i data-lucide="arrow-left-right"></i></button>
         <button id="theme" class="outline secondary" type="button" aria-label="Switch theme"><i data-lucide="moon"></i></button>
+        <button id="cleanup-sessions" class="outline secondary" type="button" aria-label="Delete old sessions" title="Delete old sessions"><i data-lucide="trash-2"></i></button>
         <button id="actions-toggle" class="outline secondary" type="button" aria-label="Actions" title="Actions"><i data-lucide="settings"></i></button>
         <button id="hotkey-hints-toggle" class="outline secondary" type="button" aria-label="Show hotkey hints" title="Show hotkey hints" aria-pressed="false"><i data-lucide="circle-help"></i></button>
       </div>
@@ -272,6 +284,11 @@
   </aside>
   <div class="panel-resizer" role="separator" aria-orientation="vertical" tabindex="0"></div>
   <aside id="panel-workspace">
+    <div id="mobile-breadcrumb" aria-label="Current project and worktree">
+      <button type="button" data-breadcrumb="project">(empty)</button>
+      <span aria-hidden="true">&gt;</span>
+      <button type="button" data-breadcrumb="worktree">(empty)</button>
+    </div>
     <nav id="workspace-tabs" aria-label="Workspace tabs">
       <button type="button" data-workspace-tab="tab-files" aria-controls="tab-files" aria-selected="false">Files</button>
       <button type="button" data-workspace-tab="tab-git" aria-controls="tab-git" aria-selected="false">Git</button>
@@ -366,6 +383,20 @@
       </footer>
     </article>
   </dialog>
+  <dialog id="cleanup-dialog">
+    <article>
+      <header><strong>Delete old sessions</strong></header>
+      <label for="cleanup-days">Delete after (days)</label>
+      <input id="cleanup-days" type="number" min="0" step="1" value="8">
+      <small>Busy sessions and unsupported harnesses are skipped. Deletion is permanent.</small>
+      <div id="cleanup-results" aria-live="polite"></div>
+      <footer>
+        <button id="cleanup-close" class="secondary" type="button">Close</button>
+        <button id="cleanup-preview" class="outline" type="button">Preview</button>
+        <button id="cleanup-run" type="button" disabled>Apply</button>
+      </footer>
+    </article>
+  </dialog>
   <dialog id="actions-dialog">
     <article>
       <header><strong>Actions</strong><button id="actions-close" class="outline secondary" type="button" aria-label="Close actions" title="Close actions"><i data-lucide="x"></i></button></header>
@@ -374,6 +405,7 @@
       <footer><label for="hotkey-leader">Leader (press a key combination)</label><input id="hotkey-leader" readonly aria-label="Leader shortcut"></footer>
     </article>
   </dialog>
+  <script src="/lib/mermaid/mermaid.min.js"></script>
   <script type="module" src="/app_hotkey.js"></script>
   <script type="module" src="/app_files.js"></script>
   <script type="module" src="/app_git.js"></script>

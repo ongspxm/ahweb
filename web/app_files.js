@@ -105,9 +105,22 @@ window.apiLoadFiles = async (root) => {
 				.split(";")[0]
 				.toLowerCase();
 			if (selection !== fileViewRequest) return;
-			const title = document.createElement("strong");
+			const header = document.createElement("div"),
+				link = document.createElement("a"),
+				icon = document.createElement("i"),
+				title = document.createElement("strong");
+			header.className = "file-title";
+			link.href = url;
+			link.target = "_blank";
+			link.rel = "noopener noreferrer";
+			link.className = "file-raw-link";
+			icon.dataset.lucide = "file";
+			icon.setAttribute("aria-hidden", "true");
+			link.append(icon);
 			title.textContent = path.split("/").at(-1);
-			eleFileView.replaceChildren(title);
+			header.append(link, title);
+			eleFileView.replaceChildren(header);
+			if (window.lucide) window.lucide.createIcons();
 			if (
 				type.startsWith("text/") ||
 				/^application\/(json|javascript|xml|yaml|x-yaml|toml)$/.test(type)

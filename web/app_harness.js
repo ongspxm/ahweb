@@ -6,6 +6,26 @@
 
 import { gfm, gfmHtml, micromark } from "/lib/markdown/markdown.js";
 
+// mermaid utils
+window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default" });
+let mermaidID = 0;
+function _renderMermaid(source, diagram) {
+	const theme = document.documentElement.dataset.theme === "dark" ? "dark" : "default", renderID = diagram.renderID = (diagram.renderID || 0) + 1;
+	window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme });
+	window.mermaid.render(`ahweb-mermaid-${++mermaidID}`, source).then(({ svg }) => {
+		if (diagram.renderID === renderID) diagram.innerHTML = svg;
+	}).catch((err) => {
+		if (diagram.renderID === renderID) diagram.textContent = `Could not render diagram: ${err.message}`;
+	});
+}
+new MutationObserver(() => {
+	document.querySelectorAll("#messages .mermaid-code").forEach((wrapper) => {
+		const code = wrapper.querySelector("code.language-mermaid"), diagram = wrapper.querySelector(".mermaid-diagram");
+		if (code && diagram && !diagram.hidden) _renderMermaid(code.textContent, diagram);
+	});
+}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+// actual utils
 const $ = (s) => document.querySelector(s);
 const CACHE = { chats: {} };
 const enc = encodeURIComponent;
@@ -32,6 +52,8 @@ const eleDir = $("#directory"),
 	eleSess = $("#chats-list"),
 	eleProjects = $("#projects-list"),
 	eleWorktrees = $("#worktrees-list"),
+	eleBreadcrumbProject = $('[data-breadcrumb="project"]'),
+	eleBreadcrumbWorktree = $('[data-breadcrumb="worktree"]'),
 	eleFolder = $("#session-folder"),
 	eleCount = $("#session-count"),
 	elePrompt = $("#prompt"),
@@ -584,6 +606,35 @@ function renderEvents(list) {
 				extensions: [gfm()],
 				htmlExtensions: [gfmHtml()],
 			});
+
+            // rendering mermaid only for assistant msg
+			b.querySelectorAll("pre > code.language-mermaid").forEach((code) => {
+				const pre = code.parentElement, wrapper = document.createElement("div"), toggle = document.createElement("button"), diagram = document.createElement("div");
+				wrapper.className = "mermaid-code";
+				toggle.className = "outline secondary mermaid-toggle";
+				toggle.type = "button";
+				toggle.textContent = "Diagram";
+				diagram.className = "mermaid-diagram";
+				diagram.hidden = true;
+				let rendered = false;
+				toggle.addEventListener("click", () => {
+					if (!pre.hidden) {
+						pre.hidden = true;
+						diagram.hidden = false;
+						toggle.textContent = "Text";
+						if (!rendered) {
+							_renderMermaid(code.textContent, diagram);
+							rendered = true;
+						}
+					} else {
+						pre.hidden = false;
+						diagram.hidden = true;
+						toggle.textContent = "Diagram";
+					}
+				});
+				pre.replaceWith(wrapper);
+				wrapper.append(toggle, pre, diagram);
+			});
 			_images(b, e);
 		} else if (e.type === "tool_start") _toolStart(e);
 		else if (e.type === "tool_end")
@@ -677,7 +728,9 @@ function renderProjectLists() {
 		const chats = Object.values(CACHE.chats[cachePath(worktree.dirname)] || {});
 		const busy = chats.some((chat) => chat.busy),
 			pending = chats.some(
-				(chat) => Number(chat.tstamp) > Number(chat.last_opened),
+				(chat) =>
+					!chat.parent_sessid &&
+					Number(chat.tstamp) > Number(chat.last_opened),
 			);
 		if (busy || pending) {
 			const status = document.createElement("span");
@@ -690,6 +743,12 @@ function renderProjectLists() {
 	}
 	if (selectedProject && !worktreePaths.length)
 		eleWorktrees.append(document.createTextNode("No worktrees"));
+	const _basename = (path) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+	eleBreadcrumbProject.textContent = selectedProject ? _basename(selectedProject) : "(empty)";
+	const selected = worktreePaths.find((worktree) => worktree.dirname === selectedWorktree);
+	eleBreadcrumbWorktree.textContent = selectedWorktree
+		? selected?.branch || _basename(selectedWorktree)
+		: "(empty)";
 	if (window.lucide) window.lucide.createIcons();
 }
 
@@ -772,6 +831,99 @@ function apiLoadModels() {
 		});
 }
 
+{
+	const dialog = $("#cleanup-dialog"),
+		daysInput = $("#cleanup-days"),
+		results = $("#cleanup-results"),
+		previewButton = $("#cleanup-preview"),
+		runButton = $("#cleanup-run");
+	let preview = null;
+	const _reset = (clear = false) => {
+		preview = null;
+		if (clear) results.replaceChildren();
+		runButton.disabled = true;
+	};
+	const _render = (counts) => {
+		results.replaceChildren();
+		const rows = Object.entries(counts || {});
+		if (!rows.length) {
+			results.textContent = "No managed project folders";
+			return;
+		}
+		const table = document.createElement("table");
+		table.innerHTML =
+			"<thead><tr><th>Folder</th><th>Delete</th></tr></thead><tbody></tbody>";
+		const body = table.tBodies[0];
+		for (const [folder, count] of rows) {
+			const row = body.insertRow();
+			row.insertCell().textContent = folder;
+			row.insertCell().textContent = String(count);
+		}
+		results.append(table);
+	};
+	const _request = async (params, confirm, plan = "") => {
+		const query = new URLSearchParams({
+			...params,
+			confirm: confirm ? "1" : "0",
+		});
+		if (plan) query.set("plan", plan);
+		const r = await fetch(`/cleanup?${query}`, { method: "POST" });
+		const body = await r.json();
+		if (!r.ok || r.status === 207) {
+			const err = new Error(body.error || "Could not delete old sessions");
+			err.counts = r.status === 207 ? body.data || null : null;
+			throw err;
+		}
+		return { body: body.data, plan: body.planid };
+	};
+	const _preview = async () => {
+		const days = daysInput.valueAsNumber;
+		if (!Number.isInteger(days) || days < 0)
+			return setError("Days must be a nonnegative integer");
+		previewButton.disabled = runButton.disabled = true;
+		try {
+			const params = { days: String(days) };
+			const res = await _request(params, false);
+			preview = { params, plan: res.plan };
+			_render(res.body);
+			setError("");
+			runButton.disabled = !res.plan;
+		} catch (err) {
+			setError(err.message);
+		} finally {
+			previewButton.disabled = false;
+		}
+	};
+	const _run = async () => {
+		if (!preview) return;
+		previewButton.disabled = runButton.disabled = true;
+		try {
+			const res = await _request({}, true, preview.plan);
+			preview = null;
+			_render(res.body);
+			setError("");
+			dialog.close();
+			setNotice("cleanup", "Old sessions deleted");
+			await apiLoadProjects();
+		} catch (err) {
+			preview = null;
+			if (err.counts) _render(err.counts);
+			setError(err.message);
+		} finally {
+			previewButton.disabled = false;
+			runButton.disabled = !preview?.plan;
+		}
+	};
+	$("#cleanup-sessions").addEventListener("click", () => {
+		_reset(true);
+		dialog.showModal();
+	});
+	$("#cleanup-close").addEventListener("click", () => dialog.close());
+	previewButton.addEventListener("click", _preview);
+	runButton.addEventListener("click", _run);
+	daysInput.addEventListener("input", () => _reset());
+	dialog.addEventListener("close", () => _reset());
+}
 async function apiLoadProjects() {
 	try {
 		const r = await fetch("/api/config"),
@@ -1075,6 +1227,14 @@ for (const section of sideSections)
 			for (const other of sideSections)
 				if (other !== section) other.open = false;
 	});
+for (const [crumb, section] of [
+	[eleBreadcrumbProject, sideSections[0]],
+	[eleBreadcrumbWorktree, sideSections[1]],
+])
+	crumb.addEventListener("click", () => {
+		location.hash = "#sess";
+		sideSections.forEach((item) => (item.open = item === section));
+	});
 eleRefresh.addEventListener("click", () => {
 	if (!sessid) return;
 	nextStartFrom = -1;
@@ -1086,6 +1246,7 @@ document.querySelector("#workspace-refresh").addEventListener("click", () => {
 	window.apiLoadFiles(folder);
 	window.apiLoadGit(folder);
 	window.apiLoadStatus();
+	apiLoadModels();
 });
 function growPrompt() {
 	elePrompt.style.height = "auto";

@@ -2,6 +2,21 @@ const driver = window.driver?.js?.driver,
 	dialog = document.querySelector("#actions-dialog"),
 	list = document.querySelector("#actions-list"),
 	isMobile = matchMedia("(max-width: 600px)").matches;
+let serverCompletedTours = [];
+try {
+	const r = await fetch("/api/config"),
+		config = r.ok ? await r.json() : {};
+	serverCompletedTours = Array.isArray(config.tours_done) ? config.tours_done : [];
+} catch (err) {
+	console.error("Could not load completed tours", err);
+}
+const _completedTours = () => serverCompletedTours;
+const _saveTourDone = async (id) => {
+	const params = new URLSearchParams({ key: "tour_done", value: id });
+	const r = await fetch(`/api/config?${params}`, { method: "POST" });
+	if (!r.ok) throw new Error("Could not save completed tour");
+	return r.json();
+};
 
 const _drive = (steps, onDone) =>
 	driver({
@@ -63,12 +78,18 @@ const _readCompletedTours = () => {
 		return [];
 	}
 };
+try {
+	for (const id of _readCompletedTours())
+		if (!serverCompletedTours.includes(id))
+			serverCompletedTours = await _saveTourDone(id);
+	if (_readCompletedTours().length) localStorage.removeItem("ahweb-onboarding-items");
+} catch (err) {
+	console.error("Could not migrate local tour progress", err);
+}
 const _markTourDone = (id) => {
-	const completed = _readCompletedTours();
-	if (!completed.includes(id)) completed.push(id);
-	try {
-		localStorage.setItem("ahweb-onboarding-items", JSON.stringify(completed));
-	} catch {}
+	_saveTourDone(id)
+		.then((completed) => (serverCompletedTours = completed))
+		.catch((err) => console.error(err));
 	checklist?.complete(id);
 };
 const tours = [
@@ -277,19 +298,19 @@ const checklist = window.driverChecklist?.checklist({
 	completeTitle: "Onboarding complete",
 	completeDescription: "You’re all set.",
 	launcher: false,
-	completed: _readCompletedTours(),
+	completed: _completedTours(),
 	items: [
 		{
 			id: "basic-tour",
 			title: tours[0][0],
 			action: () => tours[0][1](),
-			completeWhen: () => _readCompletedTours().includes("basic-tour"),
+			completeWhen: () => _completedTours().includes("basic-tour"),
 		},
 		{
 			id: "other-features",
 			title: tours[1][0],
 			action: () => tours[1][1](),
-			completeWhen: () => _readCompletedTours().includes("other-features"),
+			completeWhen: () => _completedTours().includes("other-features"),
 		},
 	],
 });
