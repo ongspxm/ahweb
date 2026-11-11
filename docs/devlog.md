@@ -5,6 +5,7 @@ roughly wut the shape of the change look like in each of api/webui
 okay to split multiline, one point one line. (look at past entry for eg)
 
 states: TODO for new, DONE for completed, PARK for in the future. REJECT for dun fix.
+ORDER: older entries at the bottom
 
 migration means we use a clean devlog.md will all these frontmatter copied over
 and save the old one as YYYYMMDD-devlog.md where YYYYMMDD is the most recent date of that file.
@@ -13,7 +14,58 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
-## 2026-11-09 TODO. some ui fixes on file tab
+## 2026-11-11 DONE. render webui mermaid diagram
+we want to render mermaid diagrams on webui
+for all code rendered as mermaid text from "assistant msg"
+add a btn that swaps between "text" and "diagram"
+
+this should be a webui side only change.
+use mermaid-js (official package is lightweight enough for use)
+it should work alongside the existing markdown rendering for "assistant msg"
+
+## 2026-11-11 DONE. save completed tours on server
+we want to be able to skip the tours for this server if we did it already
+even if on another device.
+
+fix: completed driverjs tours now saved to /config
+
+## 2026-11-11 DONE. refresh models from workspace button
+webui the refresh btn should also call /models
+to refresh the nodel and harness dict with the latest copy.
+
+## 2026-11-11 DONE. mobile project/worktree breadcrumb
+on mobile. add a breadcrumb bar above the tabs.
+it should show "(proj dir basename) > (worktree branch)"
+display "(empty)" for anything not selected
+
+when i click on the project dir basename, it should open sess panel, projects part
+similar for worktree branch name
+
+## 2026-11-11 DONE. webui worktree status should skip child pending
+we can have many child sessions, we dun always read it
+we dun wan the worktree to keep showing pending, we are ok for subsessions to be unread.
+but any session that's busy should mark worktree busy
+
+## 2026-11-11 DONE. opencode session wrong token usage
+webui. opencode session showed 0% token usage in webui
+dig: context tokens needs to be updated using last completed assistant message,
+refactor: model limits also loaded once at server init via loadModels()
+
+## 2026-11-10 DONE. populate opencode tool name
+opencode adapter shows the toolname as generic "tool" in webui
+dig: should have read "name" from the sse_event stream
+
+## 2026-11-10 DONE. update PATH during ahweb install
+we want to have the "closest experience" to terminal use for ahweb
+
+update ahweb install so that in both linux and mac
+it will update the PATH for launchd / systemd
+
+install of running a which on the executables, we will instead
+just use the PATH of the active running session
+and have some sort of log line like "copying over PATH"
+
+## 2026-11-09 DONE. some ui fixes on file tab
 the file tab, the bottom part
 on the left of the title, add a file icon
 this file icon should link to the raw file
@@ -115,28 +167,20 @@ it will keep pushing out new events/updates and be closed on busy=false
 webui update instead of having a loop that keep polling
 just keep one connection then loop to parse the returns instead.
 
-## 2026-11-08 TODO. ability to archive session
-Adapter should have a new fn called Archive(doDelete=false)
-this is so that we can remove some of the sessions and save some space
-and also the api doesnt need to maintain so many sessions
+## 2026-11-08 DONE. delete old sessions
+we want to delete old sessions to keep the api cache light
+Adapters expose CanDelete() and Delete(*Session).
+Delete() must be run thru the poll worker.
 
-when we call Archive() when doDelete then it will delete the session
-this should be per every adapter. update the readme table with
-CanArchive and CanDelete.
+split the api into 2 steps, first step gets the preview using confirm=0
+Returns {"planid":"...","data":{"foldername":{"delete":N}}}.
+expires in 2mins.
 
-add a /archive?days_archive=xxx&days_delete=yyy&confirm=1
-this will look thru all folders. if confirm=0, it will return a json of objects that fit the description
-{"foldername":{"archive":X, "delete":Y}} whr X and Y is number of sessions that fit criteria
-archive all sessions >xxx days and delete all sessions >yyy days
-if confirm=1 then it will actually run the cmd on those sessions
-also returning the same json
-note: api should check that delete>archive
+after getting the preview, we can then execute the plan using confirm=1
+recheck session before actually performing deletion
 
-webui side. we add a new btn for archive
-where we can put in the days for achive and delete as input type=number
-default to days_archive=4 and days_delete=8
-then after the api return, it will display the table of folder and count of sessions affected
-then after confirmation, we will run the api with confirm=1
+Web UI: Delete old sessions button, will open up dialog with days= input (default 8),
+preview table, and confirmation with a permanent-deletion warning.
 
 ## 2026-11-07 DONE. fix CLI predictive echo
 the CLI uses a local PredictiveEchoAddon bundled in web/lib/xterm/xterm.js

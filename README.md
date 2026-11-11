@@ -2,14 +2,21 @@
 A small local web client for various harnesses.
 config is stored in `~/.ahweb/config.json`
 
-## Install
-`go install github.com/ongspxm/ahweb@latest` (requires Go).
-Run `ahweb` to start; run the same install command again to update.
+```
+# install or update local copy of ahweb
+go install github.com/ongspxm/ahweb@latest
 
-Use `ahweb install` to install, enable, and start at boot;
-Linux requires systemd, and macOS requires `sudo`.
-Manage it with `ahweb status`, `ahweb logs`, `ahweb restart`, and `ahweb uninstall`.
-`ahweb logs` shows the last 100 lines and follows new output; press Ctrl-C to stop.
+# run ahweb directly, default port=8321
+ahweb
+ahweb --port 8000
+
+# install ahweb daemon (linux uses systemd, macos use launchd)
+ahweb install
+ahweb --port 8000 install
+
+# more info
+ahweb help
+```
 
 ## Development
 `go run .` (default port: `8321`); use `go run . -port 9090` to choose a port at startup.
@@ -43,12 +50,14 @@ All fields required unless marked optional.
     - Images use data URIs such as `data:image/png;base64,...`. Limits: `max_image_MB` (default 10 MiB decoded per image), `max_prompt_images` (default 4).
     - Returns `sessid`, `harness`, `queued`, `queued_images`, and `busy`.
 - `POST /api/stop?folder=...&sessid=...&harness=...` stops a session. Returns `sessid`, `busy`, `queued`, and `queued_images`; waiting and in-flight content is cleared and returned for restoring in the prompt box.
+- `POST /cleanup?confirm=0&days=8` previews deletion of sessions older than 8 days across all worktrees. Returns `{"planid":"...","data":{"folder":N}}`. `days` is a required nonnegative integer.
+- `POST /cleanup?confirm=1&plan=...` deletes the previewed candidates. Returns `{"data":{"folder":N}}` (plus `error` on partial failures, HTTP 207).
 - `GET /api/cli?folder=...&offset=...` is a WebSocket terminal stream. The optional byte `offset` resumes output; the server first sends a text `{"type":"offset","offset":N}` frame, then binary terminal output.
 
 ## Adapter interface
-Adapters implement `harness.Adapter`:
+Adapters implement `harness.Adapter`: to have consistency in code architecture across adapters.
 
-these are generic adapter fns and should be implemented in adapter.go
+these are generic adapter fns and should be implemented under "=== adapter admin fns" header
 - `Ready() error` nil means ready. Failed adapters are dropped at startup.
 - `GetModels() (map[string]Model, error)` returns models keyed by model ID "provider/model" (always get from source)
 - `ListSessions(realFolder) ([]SessionLite, error)` lists saved sessions for a folder.
@@ -56,19 +65,24 @@ these are generic adapter fns and should be implemented in adapter.go
     - optionally get the raw FirstUserMsg (if cheap to do)
     - if harness supports it, populate the parent sessID as well (empty for root sessions)
 
-these are session related fns and should be implemented in session.go
+these are session admin fns and should be implemented under "=== session admin fns" header
 - `Connect(*Session, doForceReconnect) error` make sures that the connection is up and live after this call.
     - should be cheap to call (close to no-op) if connection is already alive.
     - returns a partial session obj (SessionLite)
+- `CleanUp(*Session) error` closes resources owned by one session.
+- `CanDelete() bool` reports whether session deletion is supported.
+- `Delete(*Session) error` permanently deletes a session. Run this from the poll worker.
+
+these are session fns (actually control the flow of the session) and should be impleted in "=== session fns" header
 - `SendPrompt(*Session) error` sends `Session.SendingMsg` and its `Session.SendingImages`.
 - `Poll(*Session) error` refreshes session events, title/first user message, and usage stats.
     - When `DoFullHistory` is set, it should load full history; otherwise it may load only new events.
 - `Stop(*Session) error` stops the active session operation.
-- `CleanUp(*Session) error` closes resources owned by one session.
 
 Session adapter calls are run by the poll worker, except `Stop`, which the stop API calls directly.
 The interface is defined in `harness/types.go`.
 
+any other fns should be kepts under the "=== util fns" header
 Run checks with `go build ./...` and `go test ./...`.
 
 ## Adapter feature support
@@ -83,6 +97,7 @@ Run checks with `go build ./...` and `go test ./...`.
 | Send images | Y | Y | Y | Y | Y | Y |
 | Parent session IDs | Y | Y | Y | Y | N | N |
 | Tool results in saved history | Y | Y | Y | Y | ? | Y |
+| Delete | Y | ? | Y | Y | N | N |
 
 ### pi notes
 - each sess start one pi cli rpc
