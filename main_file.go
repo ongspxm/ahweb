@@ -1,6 +1,7 @@
 package main
 
 import (
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -83,5 +84,6 @@ func (a *app) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": info.Name()}))
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }

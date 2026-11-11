@@ -9,26 +9,27 @@ import (
 )
 
 type appConfig struct {
-	GitRootRealDirs            string `json:"git_root_real_dirs"`
-	DefaultShell               string `json:"default_shell"`
-	PollWorkers                int    `json:"poll_workers"`
-	NumEmptyPollBeforeCLIReset int    `json:"num_empty_poll_before_cli_reset"`
-	SessionCleanupAfterMinutes int    `json:"session_cleanup_after_minutes"`
-	FolderCleanupAfterMinutes  int    `json:"folder_cleanup_after_minutes"`
-	PiDefaultModel             string `json:"pi_default_model"`
-	PiDefaultReasoning         string `json:"pi_default_reasoning"`
-	PrimeDefaultModel          string `json:"prime_default_model"`
-	PrimeDefaultReasoning      string `json:"prime_default_reasoning"`
-	MaxImageMB                 int    `json:"max_image_MB"`
-	MaxPromptImages            int    `json:"max_prompt_images"`
-	OpencodeDefaultModel       string `json:"opencode_default_model"`
-	OpencodeDefaultReasoning   string `json:"opencode_default_reasoning"`
-	ClaudeDefaultModel         string `json:"claude_default_model"`
-	ClaudeDefaultReasoning     string `json:"claude_default_reasoning"`
-	CodexDefaultModel          string `json:"codex_default_model"`
-	CodexDefaultReasoning      string `json:"codex_default_reasoning"`
-	CursorDefaultModel         string `json:"cursor_default_model"`
-	CursorDefaultReasoning     string `json:"cursor_default_reasoning"`
+	GitRootRealDirs            string   `json:"git_root_real_dirs"`
+	ToursDone                  []string `json:"tours_done"`
+	DefaultShell               string   `json:"default_shell"`
+	PollWorkers                int      `json:"poll_workers"`
+	NumEmptyPollBeforeCLIReset int      `json:"num_empty_poll_before_cli_reset"`
+	SessionCleanupAfterMinutes int      `json:"session_cleanup_after_minutes"`
+	FolderCleanupAfterMinutes  int      `json:"folder_cleanup_after_minutes"`
+	PiDefaultModel             string   `json:"pi_default_model"`
+	PiDefaultReasoning         string   `json:"pi_default_reasoning"`
+	PrimeDefaultModel          string   `json:"prime_default_model"`
+	PrimeDefaultReasoning      string   `json:"prime_default_reasoning"`
+	MaxImageMB                 int      `json:"max_image_MB"`
+	MaxPromptImages            int      `json:"max_prompt_images"`
+	OpencodeDefaultModel       string   `json:"opencode_default_model"`
+	OpencodeDefaultReasoning   string   `json:"opencode_default_reasoning"`
+	ClaudeDefaultModel         string   `json:"claude_default_model"`
+	ClaudeDefaultReasoning     string   `json:"claude_default_reasoning"`
+	CodexDefaultModel          string   `json:"codex_default_model"`
+	CodexDefaultReasoning      string   `json:"codex_default_reasoning"`
+	CursorDefaultModel         string   `json:"cursor_default_model"`
+	CursorDefaultReasoning     string   `json:"cursor_default_reasoning"`
 }
 
 func (c appConfig) validate() error {

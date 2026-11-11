@@ -30,217 +30,11 @@ var (
 	cacheConns = make(map[string]map[string]*connStruct)
 )
 
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 func (*Adapter) Ready() error { _, err := exec.LookPath("pi"); return err }
-func (*Adapter) conn(s *harness.Session) (*connStruct, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if conn := cacheConns[s.RealPath][s.ID]; conn != nil {
-		return conn, nil
-	}
-	return nil, errors.New("Pi session is not running")
-}
-
-func (*Adapter) CleanUp(s *harness.Session) error {
-	cacheMu.Lock()
-	conn := cacheConns[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if conn == nil {
-		return nil
-	}
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.Cmd != nil {
-		_ = conn.Stdin.Close()
-		if conn.Cmd.ProcessState == nil {
-			_ = conn.Cmd.Process.Kill()
-		}
-		_ = conn.Cmd.Wait()
-		conn.Cmd, conn.Stdin, conn.Stdout, conn.Decoder = nil, nil, nil, nil
-		conn.Cursor = ""
-	}
-	cacheMu.Lock()
-	if sessions := cacheConns[s.RealPath]; sessions[s.ID] == conn {
-		delete(sessions, s.ID)
-		if len(sessions) == 0 {
-			delete(cacheConns, s.RealPath)
-		}
-	}
-	cacheMu.Unlock()
-	return nil
-}
-
-func (a *Adapter) SendPrompt(s *harness.Session) error {
-	s.Mu.Lock()
-	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
-	images := append([]string(nil), s.SendingImages...)
-	s.Mu.Unlock()
-	cacheMu.Lock()
-	conn := cacheConns[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if conn == nil {
-		return errors.New("Pi session is not running")
-	}
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.Cmd == nil || conn.Cmd.ProcessState != nil {
-		return errors.New("Pi session is not running")
-	}
-
-	request := func(command map[string]any) error {
-		id := fmt.Sprintf("prompt-%d", time.Now().UnixNano())
-		command["id"] = id
-		if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
-			return fmt.Errorf("could not send Pi command: %w", err)
-		}
-		var response struct {
-			Type    string `json:"type"`
-			ID      string `json:"id"`
-			Success bool   `json:"success"`
-			Error   string `json:"error"`
-		}
-		for {
-			if err := conn.Decoder.Decode(&response); err != nil {
-				return fmt.Errorf("could not read Pi response: %w", err)
-			}
-			if response.Type != "response" || response.ID != id {
-				continue
-			}
-			if !response.Success {
-				return fmt.Errorf("Pi refused command: %s", response.Error)
-			}
-			return nil
-		}
-	}
-	if model != nil {
-		provider, modelID, ok := strings.Cut(model.ID, "/")
-		if !ok || provider == "" || modelID == "" {
-			return fmt.Errorf("invalid Pi model ID: %q", model.ID)
-		}
-		if err := request(map[string]any{"type": "set_model", "provider": provider, "modelId": modelID}); err != nil {
-			return err
-		}
-		if reasoning == "" {
-			if len(model.Reasoning) > 0 {
-				reasoning = model.Reasoning[0]
-			}
-		}
-		if reasoning != "" {
-			if err := request(map[string]any{"type": "set_thinking_level", "level": reasoning}); err != nil {
-				return err
-			}
-		}
-	}
-	command := map[string]any{"type": "prompt", "message": prompt}
-	if len(images) > 0 {
-		parts := make([]harness.Image, 0, len(images))
-		for _, uri := range images {
-			part, err := harness.ParseImage(uri)
-			if err != nil {
-				return err
-			}
-			parts = append(parts, part)
-		}
-		command["images"] = parts
-	}
-	if err := request(command); err != nil {
-		return err
-	}
-	// Mark the session busy so the web UI will poll.
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
-	return nil
-}
-
-func (a *Adapter) Stop(s *harness.Session) error {
-	conn, err := a.conn(s)
-	if err != nil {
-		return nil
-	}
-
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.Cmd == nil || conn.Cmd.ProcessState != nil {
-		return nil
-	}
-	id := fmt.Sprintf("stop-%d", time.Now().UnixNano())
-	if err := json.NewEncoder(conn.Stdin).Encode(map[string]string{"id": id, "type": "abort"}); err != nil {
-		return fmt.Errorf("could not request Pi stop: %w", err)
-	}
-	var response struct {
-		Type    string `json:"type"`
-		ID      string `json:"id"`
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-	}
-	for {
-		if err := conn.Decoder.Decode(&response); err != nil {
-			return fmt.Errorf("could not read Pi stop response: %w", err)
-		}
-		if response.Type != "response" || response.ID != id {
-			continue
-		}
-		if !response.Success {
-			return fmt.Errorf("Pi refused stop: %s", response.Error)
-		}
-		return nil
-	}
-}
-
-func (a *Adapter) Connect(s *harness.Session, force bool) error {
-	folder := s.RealPath
-	cacheMu.Lock()
-	if cacheConns[folder] == nil {
-		cacheConns[folder] = make(map[string]*connStruct)
-	}
-	conn := cacheConns[folder][s.ID]
-	if conn == nil {
-		conn = &connStruct{}
-		cacheConns[folder][s.ID] = conn
-	}
-	cacheMu.Unlock()
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.Cmd != nil {
-		if !force && conn.Cmd.ProcessState == nil {
-			return nil
-		}
-		conn.Mu.Unlock()
-		_ = a.CleanUp(s)
-		conn.Mu.Lock()
-		cacheMu.Lock()
-		if cacheConns[folder] == nil {
-			cacheConns[folder] = make(map[string]*connStruct)
-		}
-		cacheConns[folder][s.ID] = conn
-		cacheMu.Unlock()
-	}
-	cmd := exec.Command("pi", "--mode", "rpc", "--session-id", s.ID)
-	cmd.Dir = folder
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("could not open Pi input: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return fmt.Errorf("could not open Pi output: %w", err)
-	}
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		return fmt.Errorf("could not start Pi: %w", err)
-	}
-	conn.Cmd, conn.Stdin, conn.Stdout, conn.Decoder = cmd, stdin, stdout, json.NewDecoder(stdout)
-
-	// if new connection created, i want to force a full history for consistency
-	s.Mu.Lock()
-	s.DoFullHistory = true
-	defer s.Mu.Unlock()
-	return nil
-}
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
 	cmd := exec.Command("pi", "--mode", "rpc", "--no-session")
@@ -406,6 +200,278 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		_ = file.Close()
 	}
 	return sessions, nil
+}
+
+// === session admin fns
+
+func (*Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	conn := cacheConns[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.Cmd != nil {
+		_ = conn.Stdin.Close()
+		if conn.Cmd.ProcessState == nil {
+			_ = conn.Cmd.Process.Kill()
+		}
+		_ = conn.Cmd.Wait()
+		conn.Cmd, conn.Stdin, conn.Stdout, conn.Decoder = nil, nil, nil, nil
+		conn.Cursor = ""
+	}
+	cacheMu.Lock()
+	if sessions := cacheConns[s.RealPath]; sessions[s.ID] == conn {
+		delete(sessions, s.ID)
+		if len(sessions) == 0 {
+			delete(cacheConns, s.RealPath)
+		}
+	}
+	cacheMu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Connect(s *harness.Session, force bool) error {
+	folder := s.RealPath
+	cacheMu.Lock()
+	if cacheConns[folder] == nil {
+		cacheConns[folder] = make(map[string]*connStruct)
+	}
+	conn := cacheConns[folder][s.ID]
+	if conn == nil {
+		conn = &connStruct{}
+		cacheConns[folder][s.ID] = conn
+	}
+	cacheMu.Unlock()
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.Cmd != nil {
+		if !force && conn.Cmd.ProcessState == nil {
+			return nil
+		}
+		conn.Mu.Unlock()
+		_ = a.CleanUp(s)
+		conn.Mu.Lock()
+		cacheMu.Lock()
+		if cacheConns[folder] == nil {
+			cacheConns[folder] = make(map[string]*connStruct)
+		}
+		cacheConns[folder][s.ID] = conn
+		cacheMu.Unlock()
+	}
+	cmd := exec.Command("pi", "--mode", "rpc", "--session-id", s.ID)
+	cmd.Dir = folder
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("could not open Pi input: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("could not open Pi output: %w", err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("could not start Pi: %w", err)
+	}
+	conn.Cmd, conn.Stdin, conn.Stdout, conn.Decoder = cmd, stdin, stdout, json.NewDecoder(stdout)
+
+	// if new connection created, i want to force a full history for consistency
+	s.Mu.Lock()
+	s.DoFullHistory = true
+	defer s.Mu.Unlock()
+	return nil
+}
+
+func (*Adapter) CanDelete() bool { return true }
+
+func (a *Adapter) Delete(s *harness.Session) error {
+	if s.GetIsBusy() {
+		return errors.New("cannot delete a busy Pi session")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	encoded := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(strings.TrimLeft(s.RealPath, "/\\"))
+	dir := filepath.Join(home, ".pi", "agent", "sessions", "--"+encoded+"--")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var sessionPath string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		var header struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+			CWD  string `json:"cwd"`
+		}
+		err = json.NewDecoder(bufio.NewReader(file)).Decode(&header)
+		_ = file.Close()
+		if err == nil && header.Type == "session" && header.ID == s.ID && header.CWD == s.RealPath {
+			sessionPath = path
+			break
+		}
+	}
+	if sessionPath == "" {
+		return fmt.Errorf("Pi session %q was not found", s.ID)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" || filepath.Join(dir, entry.Name()) == sessionPath {
+			continue
+		}
+		file, err := os.Open(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var header struct {
+			ParentSession string `json:"parentSession"`
+		}
+		err = json.NewDecoder(bufio.NewReader(file)).Decode(&header)
+		_ = file.Close()
+		if err == nil && header.ParentSession != "" {
+			parent, _ := filepath.Abs(header.ParentSession)
+			current, _ := filepath.Abs(sessionPath)
+			if filepath.Clean(parent) == filepath.Clean(current) {
+				return errors.New("cannot delete a Pi session with child sessions")
+			}
+		}
+	}
+	if err := a.CleanUp(s); err != nil {
+		return err
+	}
+	return os.Remove(sessionPath)
+}
+
+// === session fns
+
+func (a *Adapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
+	images := append([]string(nil), s.SendingImages...)
+	s.Mu.Unlock()
+	cacheMu.Lock()
+	conn := cacheConns[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if conn == nil {
+		return errors.New("Pi session is not running")
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.Cmd == nil || conn.Cmd.ProcessState != nil {
+		return errors.New("Pi session is not running")
+	}
+
+	request := func(command map[string]any) error {
+		id := fmt.Sprintf("prompt-%d", time.Now().UnixNano())
+		command["id"] = id
+		if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
+			return fmt.Errorf("could not send Pi command: %w", err)
+		}
+		var response struct {
+			Type    string `json:"type"`
+			ID      string `json:"id"`
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}
+		for {
+			if err := conn.Decoder.Decode(&response); err != nil {
+				return fmt.Errorf("could not read Pi response: %w", err)
+			}
+			if response.Type != "response" || response.ID != id {
+				continue
+			}
+			if !response.Success {
+				return fmt.Errorf("Pi refused command: %s", response.Error)
+			}
+			return nil
+		}
+	}
+	if model != nil {
+		provider, modelID, ok := strings.Cut(model.ID, "/")
+		if !ok || provider == "" || modelID == "" {
+			return fmt.Errorf("invalid Pi model ID: %q", model.ID)
+		}
+		if err := request(map[string]any{"type": "set_model", "provider": provider, "modelId": modelID}); err != nil {
+			return err
+		}
+		if reasoning == "" {
+			if len(model.Reasoning) > 0 {
+				reasoning = model.Reasoning[0]
+			}
+		}
+		if reasoning != "" {
+			if err := request(map[string]any{"type": "set_thinking_level", "level": reasoning}); err != nil {
+				return err
+			}
+		}
+	}
+	command := map[string]any{"type": "prompt", "message": prompt}
+	if len(images) > 0 {
+		parts := make([]harness.Image, 0, len(images))
+		for _, uri := range images {
+			part, err := harness.ParseImage(uri)
+			if err != nil {
+				return err
+			}
+			parts = append(parts, part)
+		}
+		command["images"] = parts
+	}
+	if err := request(command); err != nil {
+		return err
+	}
+	// Mark the session busy so the web UI will poll.
+	s.Mu.Lock()
+	s.BusyCli = true
+	s.Mu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Stop(s *harness.Session) error {
+	conn, err := a.conn(s)
+	if err != nil {
+		return nil
+	}
+
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.Cmd == nil || conn.Cmd.ProcessState != nil {
+		return nil
+	}
+	id := fmt.Sprintf("stop-%d", time.Now().UnixNano())
+	if err := json.NewEncoder(conn.Stdin).Encode(map[string]string{"id": id, "type": "abort"}); err != nil {
+		return fmt.Errorf("could not request Pi stop: %w", err)
+	}
+	var response struct {
+		Type    string `json:"type"`
+		ID      string `json:"id"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	for {
+		if err := conn.Decoder.Decode(&response); err != nil {
+			return fmt.Errorf("could not read Pi stop response: %w", err)
+		}
+		if response.Type != "response" || response.ID != id {
+			continue
+		}
+		if !response.Success {
+			return fmt.Errorf("Pi refused stop: %s", response.Error)
+		}
+		return nil
+	}
 }
 
 func (a *Adapter) Poll(s *harness.Session) error {
@@ -651,4 +717,15 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 	s.Mu.Unlock()
 	return nil
+}
+
+// === utils fns
+
+func (*Adapter) conn(s *harness.Session) (*connStruct, error) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if conn := cacheConns[s.RealPath][s.ID]; conn != nil {
+		return conn, nil
+	}
+	return nil, errors.New("Pi session is not running")
 }

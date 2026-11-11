@@ -44,7 +44,8 @@ var (
 	daemonStartMu sync.Mutex
 )
 
-// === adapter fns
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 func (*Adapter) Ready() error {
@@ -144,245 +145,6 @@ func (*Adapter) Ready() error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-func (*Adapter) conn(s *harness.Session) (*Conn, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if conn := cacheConns[s.RealPath][s.ID]; conn != nil {
-		return conn, nil
-	}
-	return nil, errors.New("prime session is not connected")
-}
-
-func (*Adapter) CleanUp(s *harness.Session) error {
-	cacheMu.Lock()
-	conn := cacheConns[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if conn == nil {
-		return nil
-	}
-
-	conn.Mu.Lock()
-	if conn.sock != nil && conn.ConnID != "" {
-		var state struct {
-			AttachedClients int `json:"attachedClients"`
-		}
-		if err := conn.call("get_state", nil, &state); err == nil && state.AttachedClients == 0 {
-			_ = conn.call("kill", nil, nil)
-		}
-	}
-	conn.close()
-	conn.ConnID, conn.MsgCursor = "", 0
-	conn.Mu.Unlock()
-
-	cacheMu.Lock()
-	if sessions := cacheConns[s.RealPath]; sessions[s.ID] == conn {
-		delete(sessions, s.ID)
-		if len(sessions) == 0 {
-			delete(cacheConns, s.RealPath)
-		}
-	}
-	cacheMu.Unlock()
-	return nil
-}
-
-func (a *Adapter) Connect(s *harness.Session, force bool) error {
-	// setting up all the cache and structs
-	cacheMu.Lock()
-	if cacheConns[s.RealPath] == nil {
-		cacheConns[s.RealPath] = make(map[string]*Conn)
-	}
-	conn := cacheConns[s.RealPath][s.ID]
-	if conn == nil {
-		conn = &Conn{}
-		cacheConns[s.RealPath][s.ID] = conn
-	}
-	cacheMu.Unlock()
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-
-	// chk if socket is working, if working, then leave it
-	if conn.sock != nil && conn.ConnID != "" {
-		var state struct {
-			IsStreaming bool `json:"isStreaming"`
-		}
-		if err := conn.call("get_state", nil, &state); err == nil {
-			if force {
-				s.Mu.Lock()
-				s.DoFullHistory = true
-				s.Mu.Unlock()
-			}
-			return nil
-		}
-		conn.close()
-		conn.ConnID, conn.MsgCursor = "", 0
-	}
-	if conn.sock != nil {
-		conn.close()
-	}
-
-	// create session jsonl if missing, cos prime agent daemon needs that.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("could not find prime home: %w", err)
-	}
-	path := filepath.Join(home, ".prime", "agent", "sessions", s.ID+".jsonl")
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("could not inspect prime session: %w", err)
-		}
-		header := struct {
-			Type      string `json:"type"`
-			Version   int    `json:"version"`
-			ID        string `json:"id"`
-			Timestamp string `json:"timestamp"`
-			CWD       string `json:"cwd"`
-			RLMDepth  int    `json:"rlmDepth"`
-		}{"session", 3, s.ID, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), s.RealPath, 0}
-		raw, err := json.Marshal(header)
-		if err != nil {
-			return fmt.Errorf("could not encode prime session header: %w", err)
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-			return fmt.Errorf("could not create prime sessions directory: %w", err)
-		}
-		if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
-			return fmt.Errorf("could not create prime session: %w", err)
-		}
-	}
-
-	if conn.sock == nil {
-		if err := a.Ready(); err != nil {
-			return err
-		}
-		socket := strings.TrimSpace(os.Getenv("PRIME_AGENT_DAEMON_SOCKET"))
-		if socket == "" {
-			socket = filepath.Join(os.TempDir(), fmt.Sprintf("prime-agent-rust-%d", os.Getuid()), "daemon.sock")
-		}
-		sock, err := net.DialTimeout("unix", socket, 2*time.Second)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errDaemonUnavailable, err)
-		}
-		decoder := json.NewDecoder(sock)
-		_ = sock.SetReadDeadline(time.Now().Add(5 * time.Second))
-		var hello struct {
-			Type     string `json:"type"`
-			Protocol struct {
-				Name    string `json:"name"`
-				Version int    `json:"version"`
-			} `json:"protocol"`
-			SchemaID string `json:"schemaId"`
-		}
-		if err := decoder.Decode(&hello); err != nil {
-			_ = sock.Close()
-			return err
-		}
-		_ = sock.SetReadDeadline(time.Time{})
-		schemaPrefix := fmt.Sprintf("protocol-%d-schema-", daemonProtocolVersion)
-		if hello.Type != "daemon_hello" || hello.Protocol.Name != daemonProtocolName || hello.Protocol.Version != daemonProtocolVersion || !strings.HasPrefix(hello.SchemaID, schemaPrefix) {
-			_ = sock.Close()
-			return fmt.Errorf("%w: protocol %s v%d schema %q", errDaemonIncompatible, hello.Protocol.Name, hello.Protocol.Version, hello.SchemaID)
-		}
-		conn.sock, conn.decoder, conn.seq = sock, decoder, 0
-	}
-
-	// checked: the create cmd to the daemon works even for multi connection
-	var created struct {
-		ConnID    string `json:"activeSessionId"`
-		SessionID string `json:"sessionId"`
-	}
-	if err := conn.call("create", map[string]any{
-		"sessionPath": path,
-		"config":      map[string]any{"cwd": s.RealPath},
-	}, &created); err != nil {
-		message := err.Error()
-		if strings.Contains(message, "Unknown daemon command") || strings.Contains(message, "malformed") {
-			return fmt.Errorf("%w: %v", errDaemonUnavailable, err)
-		}
-		return fmt.Errorf("prime daemon could not create session: %w", err)
-	}
-	if created.SessionID != "" && created.SessionID != s.ID {
-		return fmt.Errorf("prime daemon created unexpected session %s", created.SessionID)
-	}
-	if created.ConnID == "" {
-		return errors.New("prime daemon returned no active session")
-	}
-	conn.ConnID, conn.MsgCursor = created.ConnID, 0
-	s.Mu.Lock()
-	s.DoFullHistory = true
-	s.Mu.Unlock()
-	return nil
-}
-
-func (a *Adapter) SendPrompt(s *harness.Session) error {
-	s.Mu.Lock()
-	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
-	images := append([]string(nil), s.SendingImages...)
-	s.Mu.Unlock()
-	cacheMu.Lock()
-	conn := cacheConns[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if conn == nil {
-		return errors.New("prime session is not connected")
-	}
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.sock == nil {
-		return errors.New("prime session is not connected")
-	}
-	if model != nil {
-		provider, modelID, ok := strings.Cut(model.ID, "/")
-		if !ok || provider == "" || modelID == "" {
-			return fmt.Errorf("invalid prime model ID: %q", model.ID)
-		}
-		if err := conn.call("set_model", map[string]any{"provider": provider, "modelId": modelID}, nil); err != nil {
-			return err
-		}
-		if reasoning == "" && len(model.Reasoning) > 0 {
-			reasoning = model.Reasoning[0]
-		}
-		if reasoning != "" {
-			if err := conn.call("set_thinking_level", map[string]any{"level": reasoning}, nil); err != nil {
-				return err
-			}
-		}
-	}
-	payload := map[string]any{"message": prompt}
-	if len(images) > 0 {
-		parts := make([]harness.Image, 0, len(images))
-		for _, uri := range images {
-			part, err := harness.ParseImage(uri)
-			if err != nil {
-				return err
-			}
-			parts = append(parts, part)
-		}
-		payload["images"] = parts
-	}
-	if err := conn.call("prompt", payload, nil); err != nil {
-		return err
-	}
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
-	return nil
-}
-
-func (a *Adapter) Stop(s *harness.Session) error {
-	conn, err := a.conn(s)
-	if err != nil {
-		return nil
-	}
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
-	if conn.sock == nil || conn.ConnID == "" {
-		return nil
-	}
-	err = conn.call("abort", nil, nil)
-	if err != nil && (strings.Contains(err.Error(), "Unknown active session") || strings.Contains(err.Error(), "not processing")) {
-		return nil
-	}
-	return err
 }
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
@@ -564,6 +326,389 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 	return sessions, nil
 }
 
+func (c *Conn) call(command string, params map[string]any, data any) error {
+	if c.sock == nil {
+		return errDaemonUnavailable
+	}
+	c.seq++
+
+	id := fmt.Sprintf("%s-%d", command, c.seq)
+	body := make(map[string]any, len(params)+2)
+	body["type"] = command
+	body["id"] = id
+	for key, value := range params {
+		body[key] = value
+	}
+	if c.ConnID != "" {
+		body["activeSessionId"] = c.ConnID
+	}
+
+	envelope := map[string]any{
+		"type":     "command",
+		"id":       id,
+		"protocol": map[string]any{"name": daemonProtocolName, "version": daemonProtocolVersion},
+		"clientId": daemonClientID,
+		"command":  body,
+	}
+	if err := json.NewEncoder(c.sock).Encode(envelope); err != nil {
+		c.close()
+		return fmt.Errorf("%w: could not send %s command: %v", errDaemonUnavailable, command, err)
+	}
+
+	_ = c.sock.SetReadDeadline(time.Now().Add(30 * time.Second))
+	for {
+		var response struct {
+			Type    string          `json:"type"`
+			ID      string          `json:"id"`
+			Success bool            `json:"success"`
+			Error   string          `json:"error"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if err := c.decoder.Decode(&response); err != nil {
+			c.close()
+			return fmt.Errorf("%w: could not read %s response: %v", errDaemonUnavailable, command, err)
+		}
+		if response.Type == "daemon_closing" {
+			c.close()
+			return fmt.Errorf("%w: daemon closed the connection", errDaemonUnavailable)
+		}
+		if response.Type != "response" || response.ID != id {
+			continue
+		}
+		if !response.Success {
+			return errors.New(response.Error)
+		}
+		if data != nil && len(response.Data) > 0 && string(response.Data) != "null" {
+			if err := json.Unmarshal(response.Data, data); err != nil {
+				return fmt.Errorf("could not decode prime daemon %s response: %w", command, err)
+			}
+		}
+		return nil
+	}
+}
+
+func (c *Conn) close() {
+	if c == nil || c.sock == nil {
+		return
+	}
+	_ = c.sock.Close()
+	c.sock, c.decoder, c.seq = nil, nil, 0
+}
+
+// === session admin fns
+
+func (*Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	conn := cacheConns[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if conn == nil {
+		return nil
+	}
+
+	conn.Mu.Lock()
+	if conn.sock != nil && conn.ConnID != "" {
+		var state struct {
+			AttachedClients int `json:"attachedClients"`
+		}
+		if err := conn.call("get_state", nil, &state); err == nil && state.AttachedClients == 0 {
+			_ = conn.call("kill", nil, nil)
+		}
+	}
+	conn.close()
+	conn.ConnID, conn.MsgCursor = "", 0
+	conn.Mu.Unlock()
+
+	cacheMu.Lock()
+	if sessions := cacheConns[s.RealPath]; sessions[s.ID] == conn {
+		delete(sessions, s.ID)
+		if len(sessions) == 0 {
+			delete(cacheConns, s.RealPath)
+		}
+	}
+	cacheMu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Connect(s *harness.Session, force bool) error {
+	// setting up all the cache and structs
+	cacheMu.Lock()
+	if cacheConns[s.RealPath] == nil {
+		cacheConns[s.RealPath] = make(map[string]*Conn)
+	}
+	conn := cacheConns[s.RealPath][s.ID]
+	if conn == nil {
+		conn = &Conn{}
+		cacheConns[s.RealPath][s.ID] = conn
+	}
+	cacheMu.Unlock()
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+
+	// chk if socket is working, if working, then leave it
+	if conn.sock != nil && conn.ConnID != "" {
+		var state struct {
+			IsStreaming bool `json:"isStreaming"`
+		}
+		if err := conn.call("get_state", nil, &state); err == nil {
+			if force {
+				s.Mu.Lock()
+				s.DoFullHistory = true
+				s.Mu.Unlock()
+			}
+			return nil
+		}
+		conn.close()
+		conn.ConnID, conn.MsgCursor = "", 0
+	}
+	if conn.sock != nil {
+		conn.close()
+	}
+
+	// create session jsonl if missing, cos prime agent daemon needs that.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not find prime home: %w", err)
+	}
+	path := filepath.Join(home, ".prime", "agent", "sessions", s.ID+".jsonl")
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("could not inspect prime session: %w", err)
+		}
+		header := struct {
+			Type      string `json:"type"`
+			Version   int    `json:"version"`
+			ID        string `json:"id"`
+			Timestamp string `json:"timestamp"`
+			CWD       string `json:"cwd"`
+			RLMDepth  int    `json:"rlmDepth"`
+		}{"session", 3, s.ID, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), s.RealPath, 0}
+		raw, err := json.Marshal(header)
+		if err != nil {
+			return fmt.Errorf("could not encode prime session header: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return fmt.Errorf("could not create prime sessions directory: %w", err)
+		}
+		if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
+			return fmt.Errorf("could not create prime session: %w", err)
+		}
+	}
+
+	if conn.sock == nil {
+		if err := a.Ready(); err != nil {
+			return err
+		}
+		socket := strings.TrimSpace(os.Getenv("PRIME_AGENT_DAEMON_SOCKET"))
+		if socket == "" {
+			socket = filepath.Join(os.TempDir(), fmt.Sprintf("prime-agent-rust-%d", os.Getuid()), "daemon.sock")
+		}
+		sock, err := net.DialTimeout("unix", socket, 2*time.Second)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errDaemonUnavailable, err)
+		}
+		decoder := json.NewDecoder(sock)
+		_ = sock.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var hello struct {
+			Type     string `json:"type"`
+			Protocol struct {
+				Name    string `json:"name"`
+				Version int    `json:"version"`
+			} `json:"protocol"`
+			SchemaID string `json:"schemaId"`
+		}
+		if err := decoder.Decode(&hello); err != nil {
+			_ = sock.Close()
+			return err
+		}
+		_ = sock.SetReadDeadline(time.Time{})
+		schemaPrefix := fmt.Sprintf("protocol-%d-schema-", daemonProtocolVersion)
+		if hello.Type != "daemon_hello" || hello.Protocol.Name != daemonProtocolName || hello.Protocol.Version != daemonProtocolVersion || !strings.HasPrefix(hello.SchemaID, schemaPrefix) {
+			_ = sock.Close()
+			return fmt.Errorf("%w: protocol %s v%d schema %q", errDaemonIncompatible, hello.Protocol.Name, hello.Protocol.Version, hello.SchemaID)
+		}
+		conn.sock, conn.decoder, conn.seq = sock, decoder, 0
+	}
+
+	// checked: the create cmd to the daemon works even for multi connection
+	var created struct {
+		ConnID    string `json:"activeSessionId"`
+		SessionID string `json:"sessionId"`
+	}
+	if err := conn.call("create", map[string]any{
+		"sessionPath": path,
+		"config":      map[string]any{"cwd": s.RealPath},
+	}, &created); err != nil {
+		message := err.Error()
+		if strings.Contains(message, "Unknown daemon command") || strings.Contains(message, "malformed") {
+			return fmt.Errorf("%w: %v", errDaemonUnavailable, err)
+		}
+		return fmt.Errorf("prime daemon could not create session: %w", err)
+	}
+	if created.SessionID != "" && created.SessionID != s.ID {
+		return fmt.Errorf("prime daemon created unexpected session %s", created.SessionID)
+	}
+	if created.ConnID == "" {
+		return errors.New("prime daemon returned no active session")
+	}
+	conn.ConnID, conn.MsgCursor = created.ConnID, 0
+	s.Mu.Lock()
+	s.DoFullHistory = true
+	s.Mu.Unlock()
+	return nil
+}
+
+func (*Adapter) CanDelete() bool { return true }
+
+func (a *Adapter) Delete(s *harness.Session) error {
+	if s.GetIsBusy() {
+		return errors.New("cannot delete a busy Prime session")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	sessionPath := filepath.Join(home, ".prime", "agent", "sessions", s.ID+".jsonl")
+	file, err := os.Open(sessionPath)
+	if err != nil {
+		return err
+	}
+	originalInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	var header struct {
+		ID string `json:"id"`
+	}
+	err = json.NewDecoder(bufio.NewReader(file)).Decode(&header)
+	_ = file.Close()
+	if err != nil || header.ID != s.ID {
+		return fmt.Errorf("Prime session %q was not found", s.ID)
+	}
+	entries, err := os.ReadDir(filepath.Dir(sessionPath))
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" || entry.Name() == filepath.Base(sessionPath) {
+			continue
+		}
+		child, err := os.Open(filepath.Join(filepath.Dir(sessionPath), entry.Name()))
+		if err != nil {
+			continue
+		}
+		var childHeader struct {
+			ParentSession string `json:"parentSession"`
+		}
+		err = json.NewDecoder(bufio.NewReader(child)).Decode(&childHeader)
+		_ = child.Close()
+		if err == nil && childHeader.ParentSession == sessionPath {
+			return errors.New("cannot delete a Prime session with child sessions")
+		}
+	}
+	if err := a.Connect(s, false); err != nil {
+		return err
+	}
+	currentInfo, err := os.Stat(sessionPath)
+	if err != nil || !os.SameFile(originalInfo, currentInfo) {
+		return fmt.Errorf("Prime session %q changed while opening it", s.ID)
+	}
+	conn, err := a.conn(s)
+	if err != nil {
+		return err
+	}
+	conn.Mu.Lock()
+	var state struct {
+		IsStreaming     bool `json:"isStreaming"`
+		AttachedClients int  `json:"attachedClients"`
+	}
+	err = conn.call("get_state", nil, &state)
+	conn.Mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if state.IsStreaming || state.AttachedClients > 0 {
+		return errors.New("cannot delete a Prime session while another client is using it")
+	}
+	if err := a.CleanUp(s); err != nil {
+		return err
+	}
+	return os.Remove(sessionPath)
+}
+
+// === session fns
+
+func (a *Adapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
+	images := append([]string(nil), s.SendingImages...)
+	s.Mu.Unlock()
+	cacheMu.Lock()
+	conn := cacheConns[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if conn == nil {
+		return errors.New("prime session is not connected")
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.sock == nil {
+		return errors.New("prime session is not connected")
+	}
+	if model != nil {
+		provider, modelID, ok := strings.Cut(model.ID, "/")
+		if !ok || provider == "" || modelID == "" {
+			return fmt.Errorf("invalid prime model ID: %q", model.ID)
+		}
+		if err := conn.call("set_model", map[string]any{"provider": provider, "modelId": modelID}, nil); err != nil {
+			return err
+		}
+		if reasoning == "" && len(model.Reasoning) > 0 {
+			reasoning = model.Reasoning[0]
+		}
+		if reasoning != "" {
+			if err := conn.call("set_thinking_level", map[string]any{"level": reasoning}, nil); err != nil {
+				return err
+			}
+		}
+	}
+	payload := map[string]any{"message": prompt}
+	if len(images) > 0 {
+		parts := make([]harness.Image, 0, len(images))
+		for _, uri := range images {
+			part, err := harness.ParseImage(uri)
+			if err != nil {
+				return err
+			}
+			parts = append(parts, part)
+		}
+		payload["images"] = parts
+	}
+	if err := conn.call("prompt", payload, nil); err != nil {
+		return err
+	}
+	s.Mu.Lock()
+	s.BusyCli = true
+	s.Mu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Stop(s *harness.Session) error {
+	conn, err := a.conn(s)
+	if err != nil {
+		return nil
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.sock == nil || conn.ConnID == "" {
+		return nil
+	}
+	err = conn.call("abort", nil, nil)
+	if err != nil && (strings.Contains(err.Error(), "Unknown active session") || strings.Contains(err.Error(), "not processing")) {
+		return nil
+	}
+	return err
+}
+
 func (a *Adapter) Poll(s *harness.Session) error {
 	conn, err := a.conn(s)
 	if err != nil {
@@ -730,7 +875,17 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	return nil
 }
 
-// === helpers
+// === utils fns
+
+func (*Adapter) conn(s *harness.Session) (*Conn, error) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if conn := cacheConns[s.RealPath][s.ID]; conn != nil {
+		return conn, nil
+	}
+	return nil, errors.New("prime session is not connected")
+}
+
 func messageTimestamp(raw json.RawMessage) int64 {
 	// prime use both unix ms and ISO-8601 for timestamp (in custom_message)
 	var ms int64
@@ -744,74 +899,4 @@ func messageTimestamp(raw json.RawMessage) int64 {
 		}
 	}
 	return 0
-}
-
-// === Conn fns
-func (c *Conn) call(command string, params map[string]any, data any) error {
-	if c.sock == nil {
-		return errDaemonUnavailable
-	}
-	c.seq++
-
-	id := fmt.Sprintf("%s-%d", command, c.seq)
-	body := make(map[string]any, len(params)+2)
-	body["type"] = command
-	body["id"] = id
-	for key, value := range params {
-		body[key] = value
-	}
-	if c.ConnID != "" {
-		body["activeSessionId"] = c.ConnID
-	}
-
-	envelope := map[string]any{
-		"type":     "command",
-		"id":       id,
-		"protocol": map[string]any{"name": daemonProtocolName, "version": daemonProtocolVersion},
-		"clientId": daemonClientID,
-		"command":  body,
-	}
-	if err := json.NewEncoder(c.sock).Encode(envelope); err != nil {
-		c.close()
-		return fmt.Errorf("%w: could not send %s command: %v", errDaemonUnavailable, command, err)
-	}
-
-	_ = c.sock.SetReadDeadline(time.Now().Add(30 * time.Second))
-	for {
-		var response struct {
-			Type    string          `json:"type"`
-			ID      string          `json:"id"`
-			Success bool            `json:"success"`
-			Error   string          `json:"error"`
-			Data    json.RawMessage `json:"data"`
-		}
-		if err := c.decoder.Decode(&response); err != nil {
-			c.close()
-			return fmt.Errorf("%w: could not read %s response: %v", errDaemonUnavailable, command, err)
-		}
-		if response.Type == "daemon_closing" {
-			c.close()
-			return fmt.Errorf("%w: daemon closed the connection", errDaemonUnavailable)
-		}
-		if response.Type != "response" || response.ID != id {
-			continue
-		}
-		if !response.Success {
-			return errors.New(response.Error)
-		}
-		if data != nil && len(response.Data) > 0 && string(response.Data) != "null" {
-			if err := json.Unmarshal(response.Data, data); err != nil {
-				return fmt.Errorf("could not decode prime daemon %s response: %w", command, err)
-			}
-		}
-		return nil
-	}
-}
-
-func (c *Conn) close() {
-	if c == nil || c.sock == nil {
-		return
-	}
-	_ = c.sock.Close()
-	c.sock, c.decoder, c.seq = nil, nil, 0
 }

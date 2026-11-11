@@ -18,6 +18,8 @@ import (
 	"github.com/ongspxm/ahweb/harness"
 )
 
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 func (*Adapter) Ready() error { _, err := exec.LookPath("cursor-agent"); return err }
@@ -44,14 +46,114 @@ var (
 	cursorIDs = make(map[string]map[string]string)
 )
 
-func (*Adapter) conn(s *harness.Session) (*conn, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if c := cache[s.RealPath][s.ID]; c != nil {
-		return c, nil
+func (*Adapter) GetModels() (map[string]harness.Model, error) {
+	cmd := exec.Command("cursor-agent", "--list-models")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		if stderr.Len() > 0 {
+			return nil, fmt.Errorf("could not list Cursor models: %s", strings.TrimSpace(stderr.String()))
+		}
+		return nil, fmt.Errorf("could not list Cursor models: %w", err)
 	}
-	return nil, errors.New("Cursor session is not connected")
+	models := make(map[string]harness.Model)
+	for _, line := range strings.Split(string(output), "\n") {
+		id, _, ok := strings.Cut(strings.TrimSpace(line), " - ")
+		if !ok || id == "" {
+			continue
+		}
+		id = "cursor/" + id
+		models[id] = harness.Model{Harness: "cursor", ID: id}
+	}
+	if len(models) == 0 {
+		return nil, errors.New("Cursor Agent returned no models")
+	}
+	return models, nil
 }
+
+func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
+	root := transcriptPath(realFolder, "")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []harness.SessionLite{}, nil
+		}
+		return nil, fmt.Errorf("could not read Cursor sessions: %w", err)
+	}
+	var sessions []harness.SessionLite
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		cursorID := entry.Name()
+		path := filepath.Join(root, cursorID, cursorID+".jsonl")
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+		first, hasText := "", false
+		for scanner.Scan() {
+			var row struct {
+				Role    string `json:"role"`
+				Message struct {
+					Content any `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &row) != nil || (row.Role != "user" && row.Role != "assistant") {
+				continue
+			}
+			for _, part := range contentParts(row.Message.Content) {
+				text, _ := part["text"].(string)
+				if text == "" {
+					continue
+				}
+				hasText = true
+				if row.Role == "user" {
+					if start := strings.Index(text, "<user_query>"); start >= 0 {
+						text = text[start+len("<user_query>"):]
+						if end := strings.Index(text, "</user_query>"); end >= 0 {
+							text = text[:end]
+						}
+					}
+					first = strings.TrimSpace(text)
+					break
+				}
+			}
+			if row.Role == "user" && hasText {
+				break
+			}
+		}
+		scanErr := scanner.Err()
+		_ = file.Close()
+		if scanErr != nil || !hasText {
+			continue
+		}
+
+		// A session created in this run has a local ID; do not list its chat twice.
+		sessID := cursorID
+		cacheMu.Lock()
+		for cachedSessID, cachedCursorID := range cursorIDs[realFolder] {
+			if cachedCursorID == cursorID || sessionUUID(cachedSessID) == cursorID {
+				sessID = cachedSessID
+				break
+			}
+		}
+		cacheMu.Unlock()
+		lite := harness.SessionLite{ID: sessID, RealPath: realFolder, Harness: "cursor", FirstUserMsg: first, LastTimestampMs: info.ModTime().UnixMilli()}
+		sessions = append(sessions, lite)
+	}
+	return sessions, nil
+}
+
+// === session admin fns
 
 func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	if _, err := exec.LookPath("cursor-agent"); err != nil {
@@ -77,6 +179,37 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	}
 	return nil
 }
+
+func (*Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	c := cache[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.isClosing = true
+	cmd, done := c.cmd, c.processDone
+	if cmd != nil && cmd.Process != nil {
+		c.isStopped = true
+		_ = cmd.Process.Kill()
+	}
+	c.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	cacheMu.Lock()
+	if cache[s.RealPath][s.ID] == c {
+		delete(cache[s.RealPath], s.ID)
+		if len(cache[s.RealPath]) == 0 {
+			delete(cache, s.RealPath)
+		}
+	}
+	cacheMu.Unlock()
+	return nil
+}
+
+// === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	c, err := a.conn(s)
@@ -404,143 +537,17 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	return nil
 }
 
-func (*Adapter) CleanUp(s *harness.Session) error {
+// === utils fns
+
+func (*Adapter) conn(s *harness.Session) (*conn, error) {
 	cacheMu.Lock()
-	c := cache[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if c == nil {
-		return nil
+	defer cacheMu.Unlock()
+	if c := cache[s.RealPath][s.ID]; c != nil {
+		return c, nil
 	}
-	c.mu.Lock()
-	c.isClosing = true
-	cmd, done := c.cmd, c.processDone
-	if cmd != nil && cmd.Process != nil {
-		c.isStopped = true
-		_ = cmd.Process.Kill()
-	}
-	c.mu.Unlock()
-	if done != nil {
-		<-done
-	}
-	cacheMu.Lock()
-	if cache[s.RealPath][s.ID] == c {
-		delete(cache[s.RealPath], s.ID)
-		if len(cache[s.RealPath]) == 0 {
-			delete(cache, s.RealPath)
-		}
-	}
-	cacheMu.Unlock()
-	return nil
+	return nil, errors.New("Cursor session is not connected")
 }
 
-func (*Adapter) GetModels() (map[string]harness.Model, error) {
-	cmd := exec.Command("cursor-agent", "--list-models")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		if stderr.Len() > 0 {
-			return nil, fmt.Errorf("could not list Cursor models: %s", strings.TrimSpace(stderr.String()))
-		}
-		return nil, fmt.Errorf("could not list Cursor models: %w", err)
-	}
-	models := make(map[string]harness.Model)
-	for _, line := range strings.Split(string(output), "\n") {
-		id, _, ok := strings.Cut(strings.TrimSpace(line), " - ")
-		if !ok || id == "" {
-			continue
-		}
-		id = "cursor/" + id
-		models[id] = harness.Model{Harness: "cursor", ID: id}
-	}
-	if len(models) == 0 {
-		return nil, errors.New("Cursor Agent returned no models")
-	}
-	return models, nil
-}
-
-func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
-	root := transcriptPath(realFolder, "")
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []harness.SessionLite{}, nil
-		}
-		return nil, fmt.Errorf("could not read Cursor sessions: %w", err)
-	}
-	var sessions []harness.SessionLite
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		cursorID := entry.Name()
-		path := filepath.Join(root, cursorID, cursorID+".jsonl")
-		file, err := os.Open(path)
-		if err != nil {
-			continue
-		}
-		info, err := file.Stat()
-		if err != nil {
-			_ = file.Close()
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-		first, hasText := "", false
-		for scanner.Scan() {
-			var row struct {
-				Role    string `json:"role"`
-				Message struct {
-					Content any `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(scanner.Bytes(), &row) != nil || (row.Role != "user" && row.Role != "assistant") {
-				continue
-			}
-			for _, part := range contentParts(row.Message.Content) {
-				text, _ := part["text"].(string)
-				if text == "" {
-					continue
-				}
-				hasText = true
-				if row.Role == "user" {
-					if start := strings.Index(text, "<user_query>"); start >= 0 {
-						text = text[start+len("<user_query>"):]
-						if end := strings.Index(text, "</user_query>"); end >= 0 {
-							text = text[:end]
-						}
-					}
-					first = strings.TrimSpace(text)
-					break
-				}
-			}
-			if row.Role == "user" && hasText {
-				break
-			}
-		}
-		scanErr := scanner.Err()
-		_ = file.Close()
-		if scanErr != nil || !hasText {
-			continue
-		}
-
-		// A session created in this run has a local ID; do not list its chat twice.
-		sessID := cursorID
-		cacheMu.Lock()
-		for cachedSessID, cachedCursorID := range cursorIDs[realFolder] {
-			if cachedCursorID == cursorID || sessionUUID(cachedSessID) == cursorID {
-				sessID = cachedSessID
-				break
-			}
-		}
-		cacheMu.Unlock()
-		lite := harness.SessionLite{ID: sessID, RealPath: realFolder, Harness: "cursor", FirstUserMsg: first, LastTimestampMs: info.ModTime().UnixMilli()}
-		sessions = append(sessions, lite)
-	}
-	return sessions, nil
-}
-
-// === utils
 func sessionUUID(sessID string) string {
 	if strings.Contains(sessID, "-") {
 		return sessID

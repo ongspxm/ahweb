@@ -32,6 +32,8 @@ var (
 	modelLimits = make(map[string]int64)
 )
 
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 func (*Adapter) Ready() error {
@@ -91,7 +93,6 @@ func (*Adapter) Ready() error {
 	return nil
 }
 
-// === conn stuff
 type Conn struct {
 	OpencodeID  string
 	LastUpdated int64
@@ -165,15 +166,89 @@ func (c *Conn) call(method, path string, query url.Values, body any, result any)
 	return errors.New("opencode service unavailable")
 }
 
-// === actual adater fns
-func (a *Adapter) conn(s *harness.Session) (*Conn, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if conn := cache[s.RealPath][s.ID]; conn != nil {
-		return conn, nil
+func (a *Adapter) GetModels() (map[string]harness.Model, error) {
+	var response struct {
+		Data []struct {
+			ModelID    string `json:"modelID"`
+			ProviderID string `json:"providerID"`
+			Limit      struct {
+				Context int64 `json:"context"`
+			} `json:"limit"`
+			Variants []struct {
+				ID string `json:"id"`
+			} `json:"variants"`
+		} `json:"data"`
 	}
-	return nil, errors.New("opencode session is not connected")
+	if err := (&Conn{}).call(http.MethodGet, "/api/model", nil, nil, &response); err != nil {
+		return nil, err
+	}
+	models, limits := make(map[string]harness.Model), make(map[string]int64)
+	for _, model := range response.Data {
+		id := model.ProviderID + "/" + model.ModelID
+		entry := harness.Model{Harness: "opencode", ID: id}
+		for _, variant := range model.Variants {
+			entry.Reasoning = append(entry.Reasoning, variant.ID)
+		}
+		models[id], limits[id] = entry, model.Limit.Context
+	}
+	cacheMu.Lock()
+	modelLimits = limits
+	cacheMu.Unlock()
+	return models, nil
 }
+
+func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
+	result := make([]harness.SessionLite, 0)
+	cursor := ""
+	for {
+		q := url.Values{"directory": {realFolder}, "archived": {"false"}, "limit": {"200"}}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		var page struct {
+			Data []struct {
+				ParentID string `json:"parentID"`
+				ID       string `json:"id"`
+				Title    string `json:"title"`
+				Time     struct {
+					Updated int64 `json:"updated"`
+				} `json:"time"`
+			} `json:"data"`
+			Cursor struct {
+				Next *string `json:"next"`
+			} `json:"cursor"`
+		}
+		if err := (&Conn{}).call(http.MethodGet, "/api/session", q, nil, &page); err != nil {
+			return nil, err
+		}
+		if len(page.Data) == 0 {
+			break
+		}
+		for _, item := range page.Data {
+			id := item.ID
+			cacheMu.Lock()
+			if local := toLocalIDs[id]; local != "" {
+				id = local
+			}
+			cacheMu.Unlock()
+			parentID := item.ParentID
+			cacheMu.Lock()
+			if local := toLocalIDs[parentID]; local != "" {
+				parentID = local
+			}
+			cacheMu.Unlock()
+			s := harness.SessionLite{ID: id, RealPath: realFolder, Harness: "opencode", Name: item.Title, LastTimestampMs: item.Time.Updated, ParentSessID: parentID}
+			result = append(result, s)
+		}
+		if page.Cursor.Next == nil {
+			break
+		}
+		cursor = *page.Cursor.Next
+	}
+	return result, nil
+}
+
+// === session admin fns
 
 func (a *Adapter) Connect(s *harness.Session, force bool) error {
 	if err := a.Ready(); err != nil {
@@ -246,6 +321,44 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 	return nil
 }
 
+func (*Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	delete(cache[s.RealPath], s.ID)
+	if len(cache[s.RealPath]) == 0 {
+		delete(cache, s.RealPath)
+	}
+	return nil
+}
+
+func (*Adapter) CanDelete() bool { return true }
+
+func (a *Adapter) Delete(s *harness.Session) error {
+	if s.GetIsBusy() {
+		return errors.New("cannot delete a busy OpenCode session")
+	}
+	cacheMu.Lock()
+	id := toOpencodeIDs[s.ID]
+	cacheMu.Unlock()
+	if id == "" {
+		id = s.ID
+	}
+	conn := &Conn{OpencodeID: id}
+	if err := conn.call("DELETE", "", nil, nil, nil); err != nil {
+		return err
+	}
+	if err := a.CleanUp(s); err != nil {
+		return err
+	}
+	cacheMu.Lock()
+	delete(toOpencodeIDs, s.ID)
+	delete(toLocalIDs, id)
+	cacheMu.Unlock()
+	return nil
+}
+
+// === session fns
+
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	conn, err := a.conn(s)
 	if err != nil {
@@ -294,47 +407,6 @@ func (a *Adapter) Stop(s *harness.Session) error {
 		return nil
 	}
 	return conn.call(http.MethodPost, "/interrupt", nil, nil, nil)
-}
-
-func (*Adapter) CleanUp(s *harness.Session) error {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	delete(cache[s.RealPath], s.ID)
-	if len(cache[s.RealPath]) == 0 {
-		delete(cache, s.RealPath)
-	}
-	return nil
-}
-
-func (a *Adapter) GetModels() (map[string]harness.Model, error) {
-	var response struct {
-		Data []struct {
-			ModelID    string `json:"modelID"`
-			ProviderID string `json:"providerID"`
-			Limit      struct {
-				Context int64 `json:"context"`
-			} `json:"limit"`
-			Variants []struct {
-				ID string `json:"id"`
-			} `json:"variants"`
-		} `json:"data"`
-	}
-	if err := (&Conn{}).call(http.MethodGet, "/api/model", nil, nil, &response); err != nil {
-		return nil, err
-	}
-	models, limits := make(map[string]harness.Model), make(map[string]int64)
-	for _, model := range response.Data {
-		id := model.ProviderID + "/" + model.ModelID
-		entry := harness.Model{Harness: "opencode", ID: id}
-		for _, variant := range model.Variants {
-			entry.Reasoning = append(entry.Reasoning, variant.ID)
-		}
-		models[id], limits[id] = entry, model.Limit.Context
-	}
-	cacheMu.Lock()
-	modelLimits = limits
-	cacheMu.Unlock()
-	return models, nil
 }
 
 func (a *Adapter) Poll(s *harness.Session) error {
@@ -482,7 +554,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		write += usage.Cache.Write
 		cost += message.Cost
 		lastMessage = message
-		if message.Type == "assistant" {
+		if message.Type == "assistant" && message.Time.Completed > 0 {
 			lastAssistant, hasAssistant = message, true
 		}
 		for _, event := range message.events() {
@@ -504,53 +576,13 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	return nil
 }
 
-func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
-	result := make([]harness.SessionLite, 0)
-	cursor := ""
-	for {
-		q := url.Values{"directory": {realFolder}, "archived": {"false"}, "limit": {"200"}}
-		if cursor != "" {
-			q.Set("cursor", cursor)
-		}
-		var page struct {
-			Data []struct {
-				ParentID string `json:"parentID"`
-				ID       string `json:"id"`
-				Title    string `json:"title"`
-				Time     struct {
-					Updated int64 `json:"updated"`
-				} `json:"time"`
-			} `json:"data"`
-			Cursor struct {
-				Next *string `json:"next"`
-			} `json:"cursor"`
-		}
-		if err := (&Conn{}).call(http.MethodGet, "/api/session", q, nil, &page); err != nil {
-			return nil, err
-		}
-		if len(page.Data) == 0 {
-			break
-		}
-		for _, item := range page.Data {
-			id := item.ID
-			cacheMu.Lock()
-			if local := toLocalIDs[id]; local != "" {
-				id = local
-			}
-			cacheMu.Unlock()
-			parentID := item.ParentID
-			cacheMu.Lock()
-			if local := toLocalIDs[parentID]; local != "" {
-				parentID = local
-			}
-			cacheMu.Unlock()
-			s := harness.SessionLite{ID: id, RealPath: realFolder, Harness: "opencode", Name: item.Title, LastTimestampMs: item.Time.Updated, ParentSessID: parentID}
-			result = append(result, s)
-		}
-		if page.Cursor.Next == nil {
-			break
-		}
-		cursor = *page.Cursor.Next
+// === utils fns
+
+func (a *Adapter) conn(s *harness.Session) (*Conn, error) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if conn := cache[s.RealPath][s.ID]; conn != nil {
+		return conn, nil
 	}
-	return result, nil
+	return nil, errors.New("opencode session is not connected")
 }

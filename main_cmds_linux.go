@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -13,7 +12,7 @@ import (
 
 const serviceName = "ahweb.service"
 
-func serviceInstall() error {
+func serviceInstall(port int) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find ahweb executable: %w", err)
@@ -26,45 +25,26 @@ func serviceInstall() error {
 	if err := os.MkdirAll(unitDir, 0755); err != nil {
 		return fmt.Errorf("create systemd user directory: %w", err)
 	}
-	pathDirs := []string{}
-	seenDirs := make(map[string]bool)
-	for _, dir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
-		if dir != "" && !seenDirs[dir] {
-			pathDirs = append(pathDirs, dir)
-			seenDirs[dir] = true
-		}
-	}
-	for _, dir := range []string{"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
-		if !seenDirs[dir] {
-			pathDirs = append(pathDirs, dir)
-			seenDirs[dir] = true
-		}
-	}
-
-	// make sure that ahweb cli can access the harness cli-es
-	fmt.Println("Harnesses:")
-	harnesses := []struct{ name, command string }{{"pi", "pi"}, {"prime", "prime-agent"}, {"opencode", "opencode"}, {"claude", "claude"}, {"codex", "codex"}, {"cursor", "cursor-agent"}}
-	for _, harness := range harnesses {
-		path, err := exec.LookPath(harness.command)
-		if err != nil {
-			fmt.Printf("  %-8s !found\n", harness.name)
-			continue
-		}
-		dir, err := filepath.Abs(filepath.Dir(path))
-		if err != nil {
-			return fmt.Errorf("find %s executable directory: %w", harness.name, err)
-		}
-		if !seenDirs[dir] {
-			pathDirs = append(pathDirs, dir)
-			seenDirs[dir] = true
-		}
-		fmt.Printf("  %-8s =found (%s)\n", harness.name, path)
-	}
+	path := os.Getenv("PATH")
+	fmt.Println("Copying over PATH to systemd service")
 	_systemdQuote := func(value string) string { return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value) + `"` }
-	unit := "[Unit]\nDescription=ahweb\nAfter=network.target\n\n[Service]\nEnvironment=" + _systemdQuote("PATH="+strings.Join(pathDirs, string(os.PathListSeparator))) + "\nExecStart=" + _systemdQuote(executable) + "\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
-	if err := os.WriteFile(filepath.Join(unitDir, serviceName), []byte(unit), 0644); err != nil {
+	unit := fmt.Sprintf(`[Unit]
+Description=ahweb
+After=network.target
+
+[Service]
+Environment=%s
+ExecStart=%s --port %d
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+`, _systemdQuote("PATH="+path), _systemdQuote(executable), port)
+	unitPath := filepath.Join(unitDir, serviceName)
+	if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
 		return fmt.Errorf("write systemd user service: %w", err)
 	}
+	fmt.Printf("Wrote systemd service to %s\n", unitPath)
 
 	current, err := user.Current()
 	if err != nil {

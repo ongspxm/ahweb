@@ -46,8 +46,12 @@ type SessionLite struct {
 }
 type Session struct {
 	SessionLite
-	Events []Event
-	Mu     sync.Mutex
+	Events     []Event
+	Mu         sync.Mutex
+	OpMu       sync.Mutex
+	IsDeleted  bool
+	IsDeleting bool
+	IsStopping bool
 
 	BusyMsg bool
 	BusyCli bool
@@ -89,6 +93,8 @@ type Adapter interface {
 	Connect(s *Session, doForceReconnect bool) error
 	GetModels() (map[string]Model, error)
 	ListSessions(realFolder string) ([]SessionLite, error)
+	CanDelete() bool
+	Delete(*Session) error
 	SendPrompt(s *Session) error
 	// Poll() refreshes the session title/first user message, stats, events, and other state.
 	// Poll() should (if possible) do partial msg read, unless s.DoFullHistory=true, then do full read
@@ -121,6 +127,10 @@ func (DefaultAdapter) Stop(*Session) error {
 	return errors.New("DefaultAdapter.Stop is not implemented")
 }
 func (DefaultAdapter) CleanUp(*Session) error { return nil }
+func (DefaultAdapter) CanDelete() bool        { return false }
+func (DefaultAdapter) Delete(*Session) error {
+	return errors.New("session delete is not supported")
+}
 
 // === helper fns
 type Image struct {

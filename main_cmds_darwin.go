@@ -15,7 +15,7 @@ import (
 const serviceLabel = "com.ongspxm.ahweb"
 const servicePlist = "/Library/LaunchDaemons/com.ongspxm.ahweb.plist"
 
-func serviceInstall() error {
+func serviceInstall(port int) error {
 	if err := requireAdmin(); err != nil {
 		return err
 	}
@@ -42,10 +42,13 @@ func serviceInstall() error {
 	if err := os.Chown(logDir, uid, gid); err != nil {
 		return fmt.Errorf("set ahweb log directory owner: %w", err)
 	}
-	plist := launchdPlist(executable, account.Username, account.HomeDir, logDir)
+	path := os.Getenv("PATH")
+	fmt.Println("Copying over PATH to launchd service")
+	plist := launchdPlist(executable, account.Username, account.HomeDir, logDir, path, port)
 	if err := os.WriteFile(servicePlist, plist, 0644); err != nil {
 		return fmt.Errorf("write launchd service (run with sudo): %w", err)
 	}
+	fmt.Printf("Wrote launchd service to %s\n", servicePlist)
 	if err := runServiceManager("launchctl", "enable", "system/"+serviceLabel); err != nil {
 		return err
 	}
@@ -120,7 +123,7 @@ func installUser() (*user.User, error) {
 	return account, nil
 }
 
-func launchdPlist(executable, username, home, logDir string) []byte {
+func launchdPlist(executable, username, home, logDir, path string, port int) []byte {
 	var b bytes.Buffer
 	write := func(value string) {
 		_ = xml.EscapeText(&b, []byte(value))
@@ -132,10 +135,14 @@ func launchdPlist(executable, username, home, logDir string) []byte {
 	write(serviceLabel)
 	b.WriteString(`</string><key>ProgramArguments</key><array><string>`)
 	write(executable)
+	b.WriteString(`</string><string>--port</string><string>`)
+	write(strconv.Itoa(port))
 	b.WriteString(`</string></array><key>UserName</key><string>`)
 	write(username)
 	b.WriteString(`</string><key>EnvironmentVariables</key><dict><key>HOME</key><string>`)
 	write(home)
+	b.WriteString(`</string><key>PATH</key><string>`)
+	write(path)
 	b.WriteString(`</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>`)
 	write(filepath.Join(logDir, "stdout.log"))
 	b.WriteString(`</string><key>StandardErrorPath</key><string>`)

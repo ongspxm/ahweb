@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -48,11 +49,13 @@ func (a *app) sessionLocked(folder, harnessName, sessID string) *harness.Session
 	// this has to be called when the a.mu is locked
 	return a.sessions[folder][sessionKey{harness: harnessName, id: sessID}]
 }
-func (a *app) listFolderSessions(folder string) {
+func (a *app) listFolderSessions(folder string) error {
+	var listErrors []error
 	for name, adapter := range a.adapters {
 		listed, err := adapter.ListSessions(folder)
 		if err != nil {
 			log.Printf("adapter.list(%s, %s) failed: %v", name, folder, err)
+			listErrors = append(listErrors, fmt.Errorf("%s: %w", name, err))
 			continue
 		}
 		a.mu.Lock()
@@ -64,6 +67,10 @@ func (a *app) listFolderSessions(folder string) {
 			if existing := a.sessions[folder][key]; existing != nil {
 				// Keep identity fields immutable; poll workers read them without s.Mu.
 				existing.Mu.Lock()
+				if existing.IsDeleting || existing.IsDeleted {
+					existing.Mu.Unlock()
+					continue
+				}
 				existing.Name = s.Name
 				existing.FirstUserMsg = s.FirstUserMsg
 				existing.LastTimestampMs = s.LastTimestampMs
@@ -75,6 +82,7 @@ func (a *app) listFolderSessions(folder string) {
 		}
 		a.mu.Unlock()
 	}
+	return errors.Join(listErrors...)
 }
 
 func sessionName(s harness.SessionLite) string {
@@ -245,13 +253,27 @@ func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
 		apiWriteError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	s.Mu.Lock()
+	if s.IsDeleted || s.IsDeleting || s.IsStopping {
+		s.Mu.Unlock()
+		apiWriteError(w, http.StatusConflict, "session is being deleted or stopped")
+		return
+	}
+	s.IsStopping = true
+	s.Mu.Unlock()
 	if err := a.adapters[s.Harness].Stop(s); err != nil {
 		log.Printf("session.stop failed: sessid=%s error=%v", sessID, err)
+		s.OpMu.Lock()
 		_ = a.adapters[s.Harness].CleanUp(s)
+		s.OpMu.Unlock()
+		s.Mu.Lock()
+		s.IsStopping = false
+		s.Mu.Unlock()
 		apiWriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	s.Mu.Lock()
+	s.IsStopping = false
 	queued := s.SendingMsg
 	if queued != "" && s.QueuedMsg != "" {
 		queued += "\n"
@@ -384,6 +406,11 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 
 	// update the QueuedMsg + other stuff
 	s.Mu.Lock()
+	if s.IsDeleted || s.IsDeleting || s.IsStopping {
+		s.Mu.Unlock()
+		apiWriteError(w, http.StatusConflict, "session is being deleted or stopped")
+		return
+	}
 	if s.QueuedMsg != "" && strings.TrimSpace(req.Prompt) != "" {
 		s.QueuedMsg += "\n"
 	}
@@ -396,12 +423,7 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	apiWriteJSON(w, http.StatusAccepted, map[string]any{"sessid": s.ID, "harness": s.Harness, "queued": queued, "queued_images": queuedImages, "busy": s.GetIsBusy()})
 }
 
-func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		apiMethodNotAllowed(w)
-		return
-	}
-	result := make(map[string]map[string][]string, len(a.adapters))
+func (a *app) loadModels() {
 	for name, adapter := range a.adapters {
 		models, err := adapter.GetModels()
 		if err != nil {
@@ -414,15 +436,28 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		a.models[name] = models
 		a.mu.Unlock()
+	}
+}
 
-		result[name] = make(map[string][]string, len(models))
+func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		apiMethodNotAllowed(w)
+		return
+	}
+	a.loadModels()
+	result := make(map[string]map[string][]string, len(a.adapters))
+	a.mu.Lock()
+	for name, models := range a.models {
+		entry := make(map[string][]string, len(models))
 		for modelID, model := range models {
 			reasoning := model.Reasoning
 			if reasoning == nil {
 				reasoning = []string{}
 			}
-			result[name][modelID] = reasoning
+			entry[modelID] = reasoning
 		}
+		result[name] = entry
 	}
+	a.mu.Unlock()
 	apiWriteJSON(w, http.StatusOK, result)
 }

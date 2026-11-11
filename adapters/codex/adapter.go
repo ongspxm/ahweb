@@ -26,6 +26,8 @@ type tokenUsage struct {
 	ModelContextWindow int64 `json:"modelContextWindow"`
 }
 
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 type itemEventRef struct {
@@ -53,235 +55,7 @@ var (
 	threadIDs = map[string]map[string]string{}
 )
 
-func getConn(s *harness.Session) (*conn, error) {
-	cacheMu.Lock()
-	s.Mu.Lock()
-	id := s.ID
-	s.Mu.Unlock()
-	c := conns[s.RealPath][id]
-	cacheMu.Unlock()
-	if c == nil {
-		return nil, errors.New("Codex session is not connected")
-	}
-	if processRPC == nil {
-		return nil, errors.New("Codex App Server is not connected")
-	}
-	if err := processRPC.status(); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func decode(raw json.RawMessage, out any) error {
-	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("invalid Codex response: %w", err)
-	}
-	return nil
-}
-
 func (*Adapter) Ready() error { _, err := openStream(); return err }
-
-func (a *Adapter) Connect(s *harness.Session, _ bool) error {
-	s.Mu.Lock()
-	id := s.ID
-	s.Mu.Unlock()
-
-	// its kinda like a hacky to tell if the id is localID or codexID
-	isLocal := len(id) == 32
-	for _, r := range id {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
-			isLocal = false
-			break
-		}
-	}
-
-	// early return if possible
-	cacheMu.Lock()
-	cached := conns[s.RealPath][id]
-	threadID := id
-	if isLocal {
-		threadID = threadIDs[s.RealPath][id]
-	}
-	cacheMu.Unlock()
-	// History refreshes must not resume a healthy, possibly unsaved thread.
-	if cached != nil {
-		if processRPC != nil && processRPC.status() == nil {
-			return nil
-		}
-	}
-
-	// startup the connection
-	_ = a.CleanUp(s)
-	c, err := openStream()
-	if err != nil {
-		return err
-	}
-	method := "thread/start"
-	params := map[string]any{"cwd": s.RealPath}
-	if threadID != "" {
-		method = "thread/read"
-		params = map[string]any{"threadId": threadID}
-	}
-	raw, _, err := processRPC.call(method, params)
-	if err != nil {
-		return err
-	}
-
-	// init all the cache and pointer maps
-	var result struct {
-		Thread struct {
-			ID string `json:"id"`
-		} `json:"thread"`
-	}
-	if err := decode(raw, &result); err != nil {
-		return err
-	}
-	if result.Thread.ID == "" {
-		return errors.New("Codex returned no thread ID")
-	}
-	c.mu.Lock()
-	c.codexThreadID = result.Thread.ID
-	c.isWriter = method == "thread/start"
-	c.mu.Unlock()
-	processRPC.mu.Lock()
-	processRPC.threads[result.Thread.ID] = c
-	processRPC.mu.Unlock()
-	cacheMu.Lock()
-
-	if isLocal {
-		if threadIDs[s.RealPath] == nil {
-			threadIDs[s.RealPath] = map[string]string{}
-		}
-		threadIDs[s.RealPath][id] = result.Thread.ID
-	}
-	if conns[s.RealPath] == nil {
-		conns[s.RealPath] = map[string]*conn{}
-	}
-	conns[s.RealPath][id] = c
-	cacheMu.Unlock()
-	return nil
-}
-
-func (a *Adapter) SendPrompt(s *harness.Session) error {
-	c, err := getConn(s)
-	if err != nil {
-		return err
-	}
-	s.Mu.Lock()
-	prompt, imgs, model, effort := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning
-	s.Mu.Unlock()
-
-	input := make([]any, 0, len(imgs)+1)
-	if prompt != "" {
-		input = append(input, map[string]any{"type": "text", "text": prompt})
-	}
-	for _, uri := range imgs {
-		if _, err := harness.ParseImage(uri); err != nil {
-			return err
-		}
-		input = append(input, map[string]any{"type": "image", "url": uri})
-	}
-	c.mu.Lock()
-	threadID, isWriter := c.codexThreadID, c.isWriter
-	c.mu.Unlock()
-
-	// swap the connection to write (if needed)
-	if !isWriter {
-		if _, _, err := processRPC.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath}); err != nil {
-			return err
-		}
-		c.mu.Lock()
-		c.isWriter = true
-		c.mu.Unlock()
-	}
-
-	// form the args and send it out
-	params := map[string]any{"threadId": threadID, "input": input, "cwd": s.RealPath}
-	if model != nil {
-		params["model"] = strings.TrimPrefix(model.ID, "codex/")
-	}
-	if effort != "" {
-		params["effort"] = effort
-	}
-	raw, _, err := processRPC.call("turn/start", params)
-	if err != nil {
-		return err
-	}
-	var result struct {
-		Turn struct {
-			ID string `json:"id"`
-		} `json:"turn"`
-	}
-	if err := decode(raw, &result); err != nil {
-		return err
-	}
-
-	// setting all the updated fields
-	c.mu.Lock()
-	c.codexTurnID, c.errors = result.Turn.ID, nil
-	c.mu.Unlock()
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
-	return nil
-}
-
-func (a *Adapter) Stop(s *harness.Session) error {
-	c, err := getConn(s)
-	if err != nil {
-		return nil
-	}
-	c.mu.Lock()
-	turn := c.codexTurnID
-	c.mu.Unlock()
-	if turn == "" {
-		return nil
-	}
-	_, _, err = processRPC.call("turn/interrupt", map[string]any{"threadId": c.codexThreadID, "turnId": turn})
-	return err
-}
-
-func (a *Adapter) CleanUp(s *harness.Session) error {
-	cacheMu.Lock()
-	s.Mu.Lock()
-	id := s.ID
-	s.Mu.Unlock()
-	c := conns[s.RealPath][id]
-	cacheMu.Unlock()
-	if c != nil {
-		c.mu.Lock()
-		threadID, isWriter := c.codexThreadID, c.isWriter
-		c.mu.Unlock()
-
-		// if its writer, we actually unsub to try to give back control to other clients
-		if processRPC != nil {
-			if isWriter && processRPC.status() == nil {
-				_, _, err := processRPC.call("thread/unsubscribe", map[string]any{"threadId": threadID})
-				if err != nil {
-					return err
-				}
-			}
-			processRPC.mu.Lock()
-			delete(processRPC.threads, threadID)
-			processRPC.mu.Unlock()
-		}
-
-		c.mu.Lock()
-		c.isWriter = false
-		c.mu.Unlock()
-		cacheMu.Lock()
-
-		// clearing all the cache
-		if conns[s.RealPath][id] == c {
-			delete(conns[s.RealPath], id)
-			if len(conns[s.RealPath]) == 0 {
-				delete(conns, s.RealPath)
-			}
-		}
-		cacheMu.Unlock()
-	}
-	return nil
-}
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
 	_, err := openStream()
@@ -379,6 +153,242 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		cursor = *result.NextCursor
 	}
 	return sessions, nil
+}
+
+// === session admin fns
+
+func (a *Adapter) Connect(s *harness.Session, _ bool) error {
+	s.Mu.Lock()
+	id := s.ID
+	s.Mu.Unlock()
+
+	// its kinda like a hacky to tell if the id is localID or codexID
+	isLocal := len(id) == 32
+	for _, r := range id {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			isLocal = false
+			break
+		}
+	}
+
+	// early return if possible
+	cacheMu.Lock()
+	cached := conns[s.RealPath][id]
+	threadID := id
+	if isLocal {
+		threadID = threadIDs[s.RealPath][id]
+	}
+	cacheMu.Unlock()
+	// History refreshes must not resume a healthy, possibly unsaved thread.
+	if cached != nil {
+		if processRPC != nil && processRPC.status() == nil {
+			return nil
+		}
+	}
+
+	// startup the connection
+	_ = a.CleanUp(s)
+	c, err := openStream()
+	if err != nil {
+		return err
+	}
+	method := "thread/start"
+	params := map[string]any{"cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}
+	if threadID != "" {
+		method = "thread/read"
+		params = map[string]any{"threadId": threadID}
+	}
+	raw, _, err := processRPC.call(method, params)
+	if err != nil {
+		return err
+	}
+
+	// init all the cache and pointer maps
+	var result struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := decode(raw, &result); err != nil {
+		return err
+	}
+	if result.Thread.ID == "" {
+		return errors.New("Codex returned no thread ID")
+	}
+	c.mu.Lock()
+	c.codexThreadID = result.Thread.ID
+	c.isWriter = method == "thread/start"
+	c.mu.Unlock()
+	processRPC.mu.Lock()
+	processRPC.threads[result.Thread.ID] = c
+	processRPC.mu.Unlock()
+	cacheMu.Lock()
+
+	if isLocal {
+		if threadIDs[s.RealPath] == nil {
+			threadIDs[s.RealPath] = map[string]string{}
+		}
+		threadIDs[s.RealPath][id] = result.Thread.ID
+	}
+	if conns[s.RealPath] == nil {
+		conns[s.RealPath] = map[string]*conn{}
+	}
+	conns[s.RealPath][id] = c
+	cacheMu.Unlock()
+	return nil
+}
+
+func (a *Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	s.Mu.Lock()
+	id := s.ID
+	s.Mu.Unlock()
+	c := conns[s.RealPath][id]
+	cacheMu.Unlock()
+	if c != nil {
+		c.mu.Lock()
+		threadID, isWriter := c.codexThreadID, c.isWriter
+		c.mu.Unlock()
+
+		// if its writer, we actually unsub to try to give back control to other clients
+		if processRPC != nil {
+			if isWriter && processRPC.status() == nil {
+				_, _, err := processRPC.call("thread/unsubscribe", map[string]any{"threadId": threadID})
+				if err != nil {
+					return err
+				}
+			}
+			processRPC.mu.Lock()
+			delete(processRPC.threads, threadID)
+			processRPC.mu.Unlock()
+		}
+
+		c.mu.Lock()
+		c.isWriter = false
+		c.mu.Unlock()
+		cacheMu.Lock()
+
+		// clearing all the cache
+		if conns[s.RealPath][id] == c {
+			delete(conns[s.RealPath], id)
+			if len(conns[s.RealPath]) == 0 {
+				delete(conns, s.RealPath)
+			}
+		}
+		cacheMu.Unlock()
+	}
+	return nil
+}
+
+func (*Adapter) CanDelete() bool { return true }
+
+func (a *Adapter) Delete(s *harness.Session) error {
+	if s.GetIsBusy() {
+		return errors.New("cannot delete a busy Codex session")
+	}
+	cacheMu.Lock()
+	threadID := threadIDs[s.RealPath][s.ID]
+	c := conns[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if c != nil {
+		c.mu.Lock()
+		if c.codexThreadID != "" {
+			threadID = c.codexThreadID
+		}
+		c.mu.Unlock()
+	}
+	if threadID == "" {
+		threadID = s.ID
+		if len(s.ID) == 32 {
+			return fmt.Errorf("Codex native thread ID for %q is unavailable", s.ID)
+		}
+	}
+	if err := a.CleanUp(s); err != nil {
+		return err
+	}
+	_, _, err := processRPC.call("thread/delete", map[string]any{"threadId": threadID})
+	return err
+}
+
+// === session fns
+
+func (a *Adapter) SendPrompt(s *harness.Session) error {
+	c, err := getConn(s)
+	if err != nil {
+		return err
+	}
+	s.Mu.Lock()
+	prompt, imgs, model, effort := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning
+	s.Mu.Unlock()
+
+	input := make([]any, 0, len(imgs)+1)
+	if prompt != "" {
+		input = append(input, map[string]any{"type": "text", "text": prompt})
+	}
+	for _, uri := range imgs {
+		if _, err := harness.ParseImage(uri); err != nil {
+			return err
+		}
+		input = append(input, map[string]any{"type": "image", "url": uri})
+	}
+	c.mu.Lock()
+	threadID, isWriter := c.codexThreadID, c.isWriter
+	c.mu.Unlock()
+
+	// swap the connection to write (if needed)
+	if !isWriter {
+		if _, _, err := processRPC.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.isWriter = true
+		c.mu.Unlock()
+	}
+
+	// form the args and send it out
+	params := map[string]any{"threadId": threadID, "input": input, "cwd": s.RealPath}
+	if model != nil {
+		params["model"] = strings.TrimPrefix(model.ID, "codex/")
+	}
+	if effort != "" {
+		params["effort"] = effort
+	}
+	raw, _, err := processRPC.call("turn/start", params)
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if err := decode(raw, &result); err != nil {
+		return err
+	}
+
+	// setting all the updated fields
+	c.mu.Lock()
+	c.codexTurnID, c.errors = result.Turn.ID, nil
+	c.mu.Unlock()
+	s.Mu.Lock()
+	s.BusyCli = true
+	s.Mu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Stop(s *harness.Session) error {
+	c, err := getConn(s)
+	if err != nil {
+		return nil
+	}
+	c.mu.Lock()
+	turn := c.codexTurnID
+	c.mu.Unlock()
+	if turn == "" {
+		return nil
+	}
+	_, _, err = processRPC.call("turn/interrupt", map[string]any{"threadId": c.codexThreadID, "turnId": turn})
+	return err
 }
 
 func (a *Adapter) Poll(s *harness.Session) error {
@@ -795,5 +805,33 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		s.FullCost = fullCost
 	}
 	s.Mu.Unlock()
+	return nil
+}
+
+// === utils fns
+
+func getConn(s *harness.Session) (*conn, error) {
+	cacheMu.Lock()
+	s.Mu.Lock()
+	id := s.ID
+	s.Mu.Unlock()
+	c := conns[s.RealPath][id]
+	cacheMu.Unlock()
+	if c == nil {
+		return nil, errors.New("Codex session is not connected")
+	}
+	if processRPC == nil {
+		return nil, errors.New("Codex App Server is not connected")
+	}
+	if err := processRPC.status(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func decode(raw json.RawMessage, out any) error {
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("invalid Codex response: %w", err)
+	}
 	return nil
 }

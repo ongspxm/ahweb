@@ -6,12 +6,11 @@ import (
 	"os/exec"
 )
 
-func runCommand(args []string) (bool, error) {
+func runCommand(args []string, port int) (bool, error) {
 	if len(args) == 0 {
 		return false, nil
 	}
 	commands := map[string]func() error{
-		"install":   serviceInstall,
 		"status":    serviceStatus,
 		"logs":      serviceLogs,
 		"restart":   serviceRestart,
@@ -19,21 +18,27 @@ func runCommand(args []string) (bool, error) {
 		"help": func() error {
 			fmt.Println(`Usage: ahweb <command>
 
-  install    Install and start the service at boot
-  status     Show service status
-  logs       Show recent service logs
-  restart    Restart the service
-  uninstall  Stop and remove the service
-  help       Show this help`)
+  ahweb [--port PORT]    Run the web server directly (default port: 8321)
+  install                Install and start the service at boot (use --port before install)
+  status                 Show service status
+  logs                   Show recent service logs
+  restart                Restart the service
+  uninstall              Stop and remove the service
+  help                   Show this help`)
 			return nil
 		},
 	}
-	command, ok := commands[args[0]]
-	if !ok {
-		return false, nil
-	}
 	if len(args) != 1 {
 		return true, fmt.Errorf("%s does not accept arguments", args[0])
+	}
+
+	if args[0] == "install" {
+		return true, serviceInstall(port)
+	}
+
+	command, ok := commands[args[0]]
+	if !ok {
+		return true, fmt.Errorf("unknown command %q", args[0])
 	}
 	return true, command()
 }

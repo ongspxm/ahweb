@@ -18,6 +18,8 @@ import (
 	"github.com/ongspxm/ahweb/harness"
 )
 
+// === adapter admin fns
+
 type Adapter struct{ harness.DefaultAdapter }
 
 func (*Adapter) Ready() error { _, err := exec.LookPath("claude"); return err }
@@ -48,14 +50,144 @@ var (
 	cache   = make(map[string]map[string]*conn)
 )
 
-func (*Adapter) conn(s *harness.Session) (*conn, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if c := cache[s.RealPath][s.ID]; c != nil {
-		return c, nil
+func (*Adapter) GetModels() (map[string]harness.Model, error) {
+	if _, err := exec.LookPath("claude"); err != nil {
+		return nil, fmt.Errorf("Claude Code CLI is not installed: %w", err)
 	}
-	return nil, errors.New("Claude session is not connected")
+	cmd := exec.Command("claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("could not open Claude input: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("could not open Claude output: %w", err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("could not start Claude Code: %w", err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	timer := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
+	defer timer.Stop()
+	if _, err := io.WriteString(stdin, `{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}`+"\n"); err != nil {
+		return nil, fmt.Errorf("could not ask Claude for models: %w", err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		var msg struct {
+			Type     string `json:"type"`
+			Response struct {
+				Response struct {
+					Models []struct {
+						Value                 string   `json:"value"`
+						ResolvedModel         string   `json:"resolvedModel"`
+						SupportedEffortLevels []string `json:"supportedEffortLevels"`
+					} `json:"models"`
+				} `json:"response"`
+			} `json:"response"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &msg) != nil || msg.Type != "control_response" {
+			continue
+		}
+		models := make(map[string]harness.Model)
+		for _, m := range msg.Response.Response.Models {
+			name := m.ResolvedModel
+			if name == "" {
+				name = m.Value
+			}
+			id := "claude/" + name
+			models[id] = harness.Model{Harness: "claude", ID: id, Reasoning: m.SupportedEffortLevels}
+		}
+		if len(models) == 0 {
+			return nil, errors.New("Claude Code returned no models")
+		}
+		return models, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("could not read Claude models: %w", err)
+	}
+	return nil, errors.New("could not read Claude models")
 }
+
+func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
+	dir := filepath.Dir(transcriptPath(realFolder, ""))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []harness.SessionLite{}, nil
+		}
+		return nil, fmt.Errorf("could not read Claude sessions: %w", err)
+	}
+	var sessions []harness.SessionLite
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		nativeID := strings.TrimSuffix(entry.Name(), ".jsonl")
+		localID := nativeID
+		cacheMu.Lock()
+		for id := range cache[realFolder] {
+			if sessionUUID(id) == nativeID {
+				localID = id
+				break
+			}
+		}
+		cacheMu.Unlock()
+		lite := harness.SessionLite{ID: localID, RealPath: realFolder, Harness: "claude"}
+		f, err := os.Open(transcriptPath(realFolder, nativeID))
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+		for scanner.Scan() {
+			var row struct {
+				Timestamp string `json:"timestamp"`
+				Message   struct {
+					Role    string          `json:"role"`
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &row) != nil || (row.Message.Role != "user" && row.Message.Role != "assistant") {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, row.Timestamp); err == nil && parsed.UnixMilli() > lite.LastTimestampMs {
+				lite.LastTimestampMs = parsed.UnixMilli()
+			}
+			if row.Message.Role == "user" && lite.FirstUserMsg == "" {
+				if json.Unmarshal(row.Message.Content, &lite.FirstUserMsg) != nil {
+					var parts []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					}
+					if json.Unmarshal(row.Message.Content, &parts) == nil {
+						for _, part := range parts {
+							if part.Type == "text" && part.Text != "" {
+								lite.FirstUserMsg = part.Text
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+		f.Close()
+		if lite.FirstUserMsg != "" || lite.LastTimestampMs != 0 {
+			sessions = append(sessions, lite)
+		}
+	}
+	return sessions, nil
+}
+
+// === session admin fns
 
 func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	if _, err := exec.LookPath("claude"); err != nil {
@@ -78,30 +210,31 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	return nil
 }
 
-func eventType(role string) harness.EventType {
-	if role == "user" {
-		return harness.EventUser
+func (*Adapter) CleanUp(s *harness.Session) error {
+	cacheMu.Lock()
+	c := cache[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if c == nil {
+		return nil
 	}
-	return harness.EventAssistant
+	c.mu.Lock()
+	cmd := c.cmd
+	c.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	cacheMu.Lock()
+	if cache[s.RealPath][s.ID] == c {
+		delete(cache[s.RealPath], s.ID)
+		if len(cache[s.RealPath]) == 0 {
+			delete(cache, s.RealPath)
+		}
+	}
+	cacheMu.Unlock()
+	return nil
 }
 
-func modelContextWindow(model string) int64 {
-	model = strings.TrimPrefix(model, "claude/")
-	if strings.Contains(model, "sonnet-5") || strings.Contains(model, "opus-5") || strings.Contains(model, "opus-4-8") || strings.Contains(model, "opus-4-7") || strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6") {
-		return 1_000_000
-	}
-	if strings.HasPrefix(model, "claude-") {
-		return 200_000
-	}
-	return 0
-}
-
-func imageDataURI(block map[string]any) string {
-	source, _ := block["source"].(map[string]any)
-	mimeType, _ := source["media_type"].(string)
-	data, _ := source["data"].(string)
-	return harness.DataURI(mimeType, data)
-}
+// === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	c, err := a.conn(s)
@@ -505,168 +638,42 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	return nil
 }
 
-func (*Adapter) CleanUp(s *harness.Session) error {
+// === utils fns
+
+func (*Adapter) conn(s *harness.Session) (*conn, error) {
 	cacheMu.Lock()
-	c := cache[s.RealPath][s.ID]
-	cacheMu.Unlock()
-	if c == nil {
-		return nil
+	defer cacheMu.Unlock()
+	if c := cache[s.RealPath][s.ID]; c != nil {
+		return c, nil
 	}
-	c.mu.Lock()
-	cmd := c.cmd
-	c.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	cacheMu.Lock()
-	if cache[s.RealPath][s.ID] == c {
-		delete(cache[s.RealPath], s.ID)
-		if len(cache[s.RealPath]) == 0 {
-			delete(cache, s.RealPath)
-		}
-	}
-	cacheMu.Unlock()
-	return nil
+	return nil, errors.New("Claude session is not connected")
 }
 
-func (*Adapter) GetModels() (map[string]harness.Model, error) {
-	if _, err := exec.LookPath("claude"); err != nil {
-		return nil, fmt.Errorf("Claude Code CLI is not installed: %w", err)
+func eventType(role string) harness.EventType {
+	if role == "user" {
+		return harness.EventUser
 	}
-	cmd := exec.Command("claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("could not open Claude input: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("could not open Claude output: %w", err)
-	}
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("could not start Claude Code: %w", err)
-	}
-	defer func() {
-		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-	}()
-	timer := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
-	defer timer.Stop()
-	if _, err := io.WriteString(stdin, `{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}`+"\n"); err != nil {
-		return nil, fmt.Errorf("could not ask Claude for models: %w", err)
-	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-	for scanner.Scan() {
-		var msg struct {
-			Type     string `json:"type"`
-			Response struct {
-				Response struct {
-					Models []struct {
-						Value                 string   `json:"value"`
-						ResolvedModel         string   `json:"resolvedModel"`
-						SupportedEffortLevels []string `json:"supportedEffortLevels"`
-					} `json:"models"`
-				} `json:"response"`
-			} `json:"response"`
-		}
-		if json.Unmarshal(scanner.Bytes(), &msg) != nil || msg.Type != "control_response" {
-			continue
-		}
-		models := make(map[string]harness.Model)
-		for _, m := range msg.Response.Response.Models {
-			name := m.ResolvedModel
-			if name == "" {
-				name = m.Value
-			}
-			id := "claude/" + name
-			models[id] = harness.Model{Harness: "claude", ID: id, Reasoning: m.SupportedEffortLevels}
-		}
-		if len(models) == 0 {
-			return nil, errors.New("Claude Code returned no models")
-		}
-		return models, nil
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("could not read Claude models: %w", err)
-	}
-	return nil, errors.New("could not read Claude models")
+	return harness.EventAssistant
 }
 
-func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
-	dir := filepath.Dir(transcriptPath(realFolder, ""))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []harness.SessionLite{}, nil
-		}
-		return nil, fmt.Errorf("could not read Claude sessions: %w", err)
+func modelContextWindow(model string) int64 {
+	model = strings.TrimPrefix(model, "claude/")
+	if strings.Contains(model, "sonnet-5") || strings.Contains(model, "opus-5") || strings.Contains(model, "opus-4-8") || strings.Contains(model, "opus-4-7") || strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6") {
+		return 1_000_000
 	}
-	var sessions []harness.SessionLite
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
-			continue
-		}
-		nativeID := strings.TrimSuffix(entry.Name(), ".jsonl")
-		localID := nativeID
-		cacheMu.Lock()
-		for id := range cache[realFolder] {
-			if sessionUUID(id) == nativeID {
-				localID = id
-				break
-			}
-		}
-		cacheMu.Unlock()
-		lite := harness.SessionLite{ID: localID, RealPath: realFolder, Harness: "claude"}
-		f, err := os.Open(transcriptPath(realFolder, nativeID))
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-		for scanner.Scan() {
-			var row struct {
-				Timestamp string `json:"timestamp"`
-				Message   struct {
-					Role    string          `json:"role"`
-					Content json.RawMessage `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(scanner.Bytes(), &row) != nil || (row.Message.Role != "user" && row.Message.Role != "assistant") {
-				continue
-			}
-			if parsed, err := time.Parse(time.RFC3339Nano, row.Timestamp); err == nil && parsed.UnixMilli() > lite.LastTimestampMs {
-				lite.LastTimestampMs = parsed.UnixMilli()
-			}
-			if row.Message.Role == "user" && lite.FirstUserMsg == "" {
-				if json.Unmarshal(row.Message.Content, &lite.FirstUserMsg) != nil {
-					var parts []struct {
-						Type string `json:"type"`
-						Text string `json:"text"`
-					}
-					if json.Unmarshal(row.Message.Content, &parts) == nil {
-						for _, part := range parts {
-							if part.Type == "text" && part.Text != "" {
-								lite.FirstUserMsg = part.Text
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-		f.Close()
-		if lite.FirstUserMsg != "" || lite.LastTimestampMs != 0 {
-			sessions = append(sessions, lite)
-		}
+	if strings.HasPrefix(model, "claude-") {
+		return 200_000
 	}
-	return sessions, nil
+	return 0
 }
 
-// === utils
+func imageDataURI(block map[string]any) string {
+	source, _ := block["source"].(map[string]any)
+	mimeType, _ := source["media_type"].(string)
+	data, _ := source["data"].(string)
+	return harness.DataURI(mimeType, data)
+}
+
 func sessionUUID(id string) string {
 	if strings.Contains(id, "-") {
 		return id

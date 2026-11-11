@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"sort"
 	"strconv"
@@ -14,6 +15,11 @@ import (
 type pollJob struct {
 	session *harness.Session
 	done    *sync.WaitGroup
+
+	// deleteResult!=nil means this is a poll req to delete
+	// deleteLast is preview tstamp for us to match session tstamp
+	deleteResult chan error
+	deleteLast   int64
 }
 
 func (a *app) pollLoop() {
@@ -32,6 +38,52 @@ func (a *app) pollLoop() {
 func (a *app) pollSession(job pollJob) {
 	defer job.done.Done()
 	s := job.session
+	s.OpMu.Lock()
+	defer s.OpMu.Unlock()
+
+	// perform delete
+	if job.deleteResult != nil {
+		var err error
+		s.Mu.Lock()
+		if s.IsDeleted {
+			err = errors.New("session is already deleted")
+		} else if s.IsDeleting {
+			err = errors.New("session is already being deleted")
+		} else if s.IsStopping {
+			err = errors.New("session is stopping")
+		} else if s.BusyMsg || s.BusyCli || s.QueuedMsg != "" {
+			err = errors.New("cannot delete a busy session")
+		} else if s.LastTimestampMs != job.deleteLast {
+			err = errors.New("session changed since preview")
+		} else {
+			s.IsDeleting = true
+		}
+		s.Mu.Unlock()
+
+		if err == nil {
+			if adapter := a.adapters[s.Harness]; adapter == nil {
+				err = errors.New("session adapter is unavailable")
+			} else {
+				err = adapter.Delete(s)
+			}
+			s.Mu.Lock()
+			s.IsDeleting = false
+			if err == nil {
+				s.IsDeleted = true
+			}
+			s.Mu.Unlock()
+		}
+		job.deleteResult <- err
+		return
+	}
+	s.Mu.Lock()
+	retired := s.IsDeleted
+	s.Mu.Unlock()
+	if retired {
+		return
+	}
+
+	// do poll if still active
 	a.mu.Lock()
 	pollResetThreshold := a.config.NumEmptyPollBeforeCLIReset
 	a.mu.Unlock()
@@ -209,7 +261,10 @@ func (a *app) cleanupLoop() {
 							log.Printf("adapter.cleanup(%s, %s) failed: adapter missing", s.Harness, s.ID)
 							continue
 						}
-						if err := adapter.CleanUp(s); err != nil {
+						s.OpMu.Lock()
+						err := adapter.CleanUp(s)
+						s.OpMu.Unlock()
+						if err != nil {
 							log.Printf("adapter.cleanup(%s, %s) failed: %v", s.Harness, s.ID, err)
 							continue
 						}
@@ -282,9 +337,13 @@ func (a *app) cleanupLoop() {
 			a.pollJobs <- pollJob{session: s, done: &done}
 		}
 		done.Wait()
+
 		// Clean up in a second loop because it blocks; cleaned prevents repeated calls.
 		for _, s := range cleanupSessions {
-			if err := a.adapters[s.Harness].CleanUp(s); err != nil {
+			s.OpMu.Lock()
+			err := a.adapters[s.Harness].CleanUp(s)
+			s.OpMu.Unlock()
+			if err != nil {
 				log.Printf("adapter.cleanup(%s, %s) failed: %v", s.Harness, s.ID, err)
 				continue
 			}

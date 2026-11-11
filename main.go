@@ -94,18 +94,20 @@ type app struct {
 	}
 }
 
+const defaultPort = 8321
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	if handled, err := runCommand(os.Args[1:]); handled {
+	port := flag.Int("port", defaultPort, "HTTP server port")
+	flag.Parse()
+	if *port < 1 || *port > 65535 {
+		log.Fatalf("invalid port %d: must be between 1 and 65535", *port)
+	}
+	if handled, err := runCommand(flag.Args(), *port); handled {
 		if err != nil {
 			log.Fatal(err)
 		}
 		return
-	}
-	port := flag.Int("port", 8321, "HTTP server port")
-	flag.Parse()
-	if *port < 1 || *port > 65535 {
-		log.Fatalf("invalid port %d: must be between 1 and 65535", *port)
 	}
 	serverHost, err := os.Hostname()
 	if err != nil {
@@ -146,6 +148,7 @@ func main() {
 			delete(server.adapters, name)
 		}
 	}
+	server.loadModels()
 	server.lastOpened.times = make(map[string]map[string]int64)
 	seenRoots := make(map[string]bool)
 	for _, value := range strings.Split(server.config.GitRootRealDirs, "\n") {
@@ -178,6 +181,7 @@ func main() {
 	mux.HandleFunc("/api/worktrees", server.handleWorktrees)
 	mux.HandleFunc("/api/git", server.handleGit)
 	mux.HandleFunc("/api/list", server.handleList)
+	mux.HandleFunc("/cleanup", server.handleCleanup)
 	mux.HandleFunc("/api/events", server.handleEvents)
 	mux.HandleFunc("/api/stop", server.handleStop)
 	mux.HandleFunc("/api/prompt", server.handlePrompt)
@@ -298,6 +302,19 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 			c.MaxPromptImages = n
 			return nil
 		},
+		"tour_done": func(c *appConfig, value string) error {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return fmt.Errorf("tour ID is required")
+			}
+			for _, done := range c.ToursDone {
+				if done == value {
+					return nil
+				}
+			}
+			c.ToursDone = append(c.ToursDone, value)
+			return nil
+		},
 		"pi_default_model":           func(c *appConfig, value string) error { c.PiDefaultModel = value; return nil },
 		"pi_default_reasoning":       func(c *appConfig, value string) error { c.PiDefaultReasoning = value; return nil },
 		"prime_default_model":        func(c *appConfig, value string) error { c.PrimeDefaultModel = value; return nil },
@@ -347,6 +364,10 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	values, err := _config2map(updated)
 	if err != nil {
 		apiWriteError(w, http.StatusInternalServerError, "could not read config")
+		return
+	}
+	if key == "tour_done" {
+		apiWriteJSON(w, http.StatusOK, values["tours_done"])
 		return
 	}
 	apiWriteJSON(w, http.StatusOK, values[key])

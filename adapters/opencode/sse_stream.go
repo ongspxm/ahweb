@@ -72,6 +72,7 @@ type apiMessage struct {
 		Text   string `json:"text"`
 		ID     string `json:"id"`
 		CallID string `json:"callID"`
+		Name   string `json:"name"`
 		Tool   string `json:"tool"`
 		URL    string `json:"url"`
 		URI    string `json:"uri"`
@@ -167,13 +168,17 @@ func (m apiMessage) events() []harness.Event {
 			if id == "" {
 				id = part.ID
 			}
+			name := part.Name
+			if name == "" {
+				name = part.Tool
+			}
 			input := string(part.State.Input)
 			if input == "" || input == "null" {
 				input = "{}"
 			}
 			switch part.State.Status {
 			case "pending", "running", "streaming", "completed", "error":
-				out = append(out, harness.Event{Type: harness.EventToolStart, ToolName: part.Tool, ToolCallID: id, Content: input, TimestampMs: ts})
+				out = append(out, harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, Content: input, TimestampMs: ts})
 				if part.State.Status == "completed" || part.State.Status == "error" {
 					content, failed := part.State.Output, part.State.Status == "error"
 					if failed {
@@ -185,7 +190,7 @@ func (m apiMessage) events() []harness.Event {
 							images = append(images, item.URI)
 						}
 					}
-					out = append(out, harness.Event{Type: harness.EventToolEnd, ToolName: part.Tool, ToolCallID: id, Content: content, Images: images, ToolFailed: failed, TimestampMs: ts})
+					out = append(out, harness.Event{Type: harness.EventToolEnd, ToolName: name, ToolCallID: id, Content: content, Images: images, ToolFailed: failed, TimestampMs: ts})
 				}
 			}
 		}

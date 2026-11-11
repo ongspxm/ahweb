@@ -75,6 +75,24 @@ func TestConfigHandlerRejectsUnknownConfigKey(t *testing.T) {
 	}
 }
 
+func TestConfigHandlerPersistsAndDeduplicatesDoneTours(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	a := &app{config: defaultConfig}
+	post := func(key, value string) {
+		t.Helper()
+		q := url.Values{"key": {key}, "value": {value}}
+		res := testRequest(a.handleConfig, http.MethodPost, "/api/config?"+q.Encode(), "")
+		if res.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d: %s", key, res.Code, res.Body.String())
+		}
+	}
+	post("tour_done", "basic-tour")
+	post("tour_done", "basic-tour")
+	if len(a.config.ToursDone) != 1 || a.config.ToursDone[0] != "basic-tour" {
+		t.Fatalf("config = %+v", a.config)
+	}
+}
+
 // === queued prompt recovery ===
 
 type queueFailureAdapter struct{ harness.DefaultAdapter }
