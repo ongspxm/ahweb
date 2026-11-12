@@ -173,6 +173,10 @@
     #messages article.error { background-color: color-mix(in srgb, var(--pico-del-color) 10%, var(--pico-card-background-color)); }
     #messages article.error header, #messages article.error strong { color: var(--pico-del-color); }
     #queued-prompts { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #queued-wrap { align-items: center; gap: .5rem; }
+    #queued-wrap:not([hidden]) { display: flex; }
+    #queued-wrap[hidden] { display: none; }
+    #queued-wrap blockquote { flex: 1; margin-bottom: 0; }
     #image-preview { display: flex; flex-wrap: wrap; gap: .5rem; margin: .5rem 0; }
     .image-preview-item { position: relative; }
     .image-preview-item img { display: block; width: 5rem; height: 5rem; border-radius: var(--pico-border-radius); object-fit: cover; }
@@ -344,7 +348,10 @@
     <div id="messages" aria-live="polite" hx-trigger="refresh" hx-swap="none"></div>
     <footer>
       <form id="prompt-form">
-        <blockquote id="queued-prompts" aria-label="Queued messages" hidden></blockquote>
+        <div id="queued-wrap" hidden>
+          <blockquote id="queued-prompts" aria-label="Queued messages"></blockquote>
+          <button id="unqueue" class="outline secondary project-remove" type="button" aria-label="Unqueue message" title="Unqueue message"><i data-lucide="x"></i></button>
+        </div>
         <div id="prompt-wrap">
           <textarea id="prompt" name="prompt" rows="2" autocomplete="off" placeholder="Send prompt"></textarea>
         </div>

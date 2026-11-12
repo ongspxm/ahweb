@@ -51,6 +51,7 @@ const eleDir = $("#directory"),
 	eleChatStatus = $("#chat-status"),
 	eleUsage = $("#usage"),
 	eleQueued = $("#queued-prompts"),
+	eleQueuedWrap = $("#queued-wrap"),
 	eleChat = $("#messages"),
 	eleSess = $("#chats-list"),
 	eleProjects = $("#projects-list"),
@@ -96,7 +97,7 @@ function localISO(timestamp) {
 
 function clearQueuedPrompts() {
 	eleQueued.textContent = "";
-	eleQueued.hidden = true;
+	eleQueuedWrap.hidden = true;
 }
 
 const notices = new Map();
@@ -216,7 +217,7 @@ function startPollSess(f, id) {
 			if (f === cachePath(folder) && id === sessid) {
 				renderBusy(updated.busy);
 				renderEvents(body.events || []);
-				renderQueuedPrompts(updated.queued);
+				renderQueuedPrompts(updated.queued, updated.queued_images || []);
 				renderStats(updated.stats);
 			}
 			if (f === cachePath(folder)) renderSessCard(updated);
@@ -404,10 +405,10 @@ function renderReasoningList(useSaved = false) {
 	eleReasoning.disabled = levels.length === 0;
 }
 
-function renderQueuedPrompts(queue) {
+function renderQueuedPrompts(queue, images = []) {
 	const text = typeof queue === "string" ? queue : "";
 	eleQueued.textContent = text;
-	eleQueued.hidden = !text;
+	eleQueuedWrap.hidden = !text && !images.length;
 }
 
 function renderEvents(list) {
@@ -1167,7 +1168,7 @@ document.body.addEventListener("htmx:afterRequest", (e) => {
 		if (Number(q.start_from) === -1) renderReset();
 		renderEvents(body.events || []);
 		renderBusy(chat.busy);
-		renderQueuedPrompts(chat.queued);
+		renderQueuedPrompts(chat.queued, chat.queued_images || []);
 		renderStats(chat.stats);
 	}
 });
@@ -1283,6 +1284,10 @@ eleHarness.addEventListener("change", renderHarnessDetails);
 // chunk for UI for image for prompts
 async function addPromptImages(files) {
 	for (const file of files) {
+		if (typeof file === "string" && file.startsWith("data:image/")) {
+			promptImages.push({ file: null, uri: file });
+			continue;
+		}
 		if (!file?.type.startsWith("image/")) continue;
 		try {
 			const uri = await new Promise((resolve, reject) => {
@@ -1303,11 +1308,11 @@ async function addPromptImages(files) {
 			item.className = "image-preview-item";
 			const image = document.createElement("img");
 			image.src = uri;
-			image.alt = file.name;
+			image.alt = file?.name || "Queued image";
 			const remove = document.createElement("button");
 			remove.className = "secondary outline";
 			remove.textContent = "×";
-			remove.setAttribute("aria-label", `Remove ${file.name}`);
+			remove.setAttribute("aria-label", `Remove ${file?.name || "queued image"}`);
 			remove.addEventListener("click", () => {
 				promptImages.splice(index, 1);
 				_render();
@@ -1377,7 +1382,7 @@ $("#prompt-form").addEventListener("submit", async (e) => {
 		eleImagePreview.hidden = true;
 		const chat = updateChat(folder, { ...b, busy: true });
 		renderBusy(chat.busy);
-		renderQueuedPrompts(chat.queued);
+		renderQueuedPrompts(chat.queued, chat.queued_images || []);
 		if (isNew) {
 			apiLoadSess(folder, b.sessid);
 			apiLoadSessList(folder);
@@ -1429,6 +1434,35 @@ $("#stop").addEventListener("click", async (e) => {
 	} finally {
 		button.disabled = false;
 		button.innerHTML = stopIcon;
+	}
+});
+
+$("#unqueue").addEventListener("click", async (e) => {
+	if (!sessid) return;
+	const f = folder,
+		id = sessid,
+		harness = chatInfo(folder, sessid)?.harness || "",
+		button = e.currentTarget;
+	button.disabled = true;
+	try {
+		const r = await fetch(
+			`/api/unqueue?folder=${enc(f)}&sessid=${enc(id)}&harness=${enc(harness)}`,
+			{ method: "POST" },
+		);
+		const b = await r.json();
+		if (!r.ok) throw new Error(b.error || "Request failed");
+		updateChat(f, { ...b, sessid: id, queued: "", queued_images: [] });
+		if (f === folder && id === sessid) {
+			if (b.queued) elePrompt.value = b.queued;
+			await addPromptImages(b.queued_images || []);
+			growPrompt();
+			renderQueuedPrompts("", []);
+		}
+		apiLoadSessList(f);
+	} catch (err) {
+		setError(err.message);
+	} finally {
+		button.disabled = false;
 	}
 });
 

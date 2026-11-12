@@ -16,6 +16,16 @@ potential backlog:
 - webui git tab, dload patch
 - webui fil tab, uload files
 
+## 2026-11-12 DONE. unqueue msgs from session
+i want to remove queued msg, but dun wan stop.
+add a /unqueue api that basically clears the queuedMsg and queuedImages
+similar to /stop it should return them
+
+webui. for the queued msg, on the right, should have a cross
+(kinda like the one at the right of each project)
+when click, it will send the unqueue
+then populate back the prompt and the images
+
 ## 2026-11-12 DONE. avoid calling GetModels all the time
 api /models shouldnt call the GetModels() all the time
 because the adapters often are slow to GetModels() and /models is called everytime we refresh

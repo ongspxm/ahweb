@@ -50,6 +50,7 @@ All fields required unless marked optional.
     - Images use data URIs such as `data:image/png;base64,...`. Limits: `max_image_MB` (default 10 MiB decoded per image), `max_prompt_images` (default 4).
     - Returns `sessid`, `harness`, `queued`, `queued_images`, and `busy`.
 - `POST /api/stop?folder=...&sessid=...&harness=...` stops a session. Returns `sessid`, `busy`, `queued`, and `queued_images`; waiting and in-flight content is cleared and returned for restoring in the prompt box.
+- `POST /api/unqueue?folder=...&sessid=...&harness=...` clears and returns waiting `queued` text and `queued_images` without stopping the active operation.
 - `POST /cleanup?confirm=0&days=8` previews deletion of sessions older than 8 days across all worktrees. Returns `{"planid":"...","data":{"folder":N}}`. `days` is a required nonnegative integer.
 - `POST /cleanup?confirm=1&plan=...` deletes the previewed candidates. Returns `{"data":{"folder":N}}` (plus `error` on partial failures, HTTP 207).
 - `GET /api/cli?folder=...&offset=...` is a WebSocket terminal stream. The optional byte `offset` resumes output; the server first sends a text `{"type":"offset","offset":N}` frame, then binary terminal output.

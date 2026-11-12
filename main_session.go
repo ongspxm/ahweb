@@ -288,6 +288,45 @@ func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
 	apiWriteJSON(w, http.StatusOK, map[string]any{"sessid": sessID, "busy": s.GetIsBusy(), "queued": queued, "queued_images": queuedImages})
 }
 
+func (a *app) handleUnqueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		apiMethodNotAllowed(w)
+		return
+	}
+	folder, err := getAbsPath(r.URL.Query().Get("folder"))
+	if err != nil {
+		apiWriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sessID := strings.TrimSpace(r.URL.Query().Get("sessid"))
+	if sessID == "" {
+		apiWriteError(w, http.StatusBadRequest, "sessid is required")
+		return
+	}
+	harnessName := strings.TrimSpace(r.URL.Query().Get("harness"))
+	if harnessName == "" {
+		apiWriteError(w, http.StatusBadRequest, "harness is required")
+		return
+	}
+	a.mu.Lock()
+	s := a.sessionLocked(folder, harnessName, sessID)
+	a.mu.Unlock()
+	if s == nil {
+		apiWriteError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	s.Mu.Lock()
+	if s.IsDeleted || s.IsDeleting || s.IsStopping {
+		s.Mu.Unlock()
+		apiWriteError(w, http.StatusConflict, "session is being deleted or stopped")
+		return
+	}
+	queued, queuedImages := s.QueuedMsg, append([]string{}, s.QueuedImages...)
+	s.QueuedMsg, s.QueuedImages = "", nil
+	s.Mu.Unlock()
+	apiWriteJSON(w, http.StatusOK, map[string]any{"sessid": sessID, "busy": s.GetIsBusy(), "queued": queued, "queued_images": queuedImages})
+}
+
 func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// handling api params
 	if r.Method != http.MethodPost {
