@@ -156,7 +156,7 @@ func (a *app) pollSession(job pollJob) {
 		}
 		for i := len(s.Events) - 1; i >= 0; i-- {
 			if s.Events[i].TimestampMs > 0 {
-				return s.Events[i].Type == harness.EventUser || age <= 10*time.Second
+				return s.Events[i].Type == harness.EventUser || age <= 3*time.Second
 			}
 		}
 		return true
@@ -328,7 +328,11 @@ func (a *app) cleanupLoop() {
 		}
 		if summary != prevPollSummary {
 			prevPollSummary = summary
-			log.Printf("poll.session %s", summary)
+			line := "poll.session " + summary
+			a.mu.Lock()
+			a.pollStatus = line
+			a.mu.Unlock()
+			log.Printf("%s", line)
 		}
 
 		var done sync.WaitGroup

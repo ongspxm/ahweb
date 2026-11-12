@@ -237,6 +237,7 @@ func TestModelsHandlerRefreshesHealthyAdaptersAndPreservesFailedAdapterCache(t *
 		},
 	}
 
+	testRequest(a.handleStatus, "GET", "/api/status", "")
 	r := testRequest(a.handleModels, "GET", "/api/models", "")
 	if r.Code != 200 {
 		t.Fatalf("status = %d, want 200: %s", r.Code, r.Body)
@@ -244,8 +245,8 @@ func TestModelsHandlerRefreshesHealthyAdaptersAndPreservesFailedAdapterCache(t *
 	if _, ok := a.models["good"]["new/model"]; !ok || len(a.models["good"]) != 1 {
 		t.Fatalf("good cache = %+v, want refreshed models", a.models["good"])
 	}
-	if _, ok := a.models["bad"]["old/model"]; !ok {
-		t.Fatalf("bad cache = %+v, want previous models preserved", a.models["bad"])
+	if _, ok := a.models["bad"]; ok {
+		t.Fatalf("bad cache = %+v, want failed adapter removed", a.models["bad"])
 	}
 	if _, ok := a.models["other"]["keep/model"]; !ok {
 		t.Fatalf("unrelated cache = %+v, want preserved", a.models["other"])

@@ -428,6 +428,11 @@ func (a *app) loadModels() {
 		models, err := adapter.GetModels()
 		if err != nil {
 			log.Printf("adapter.models(%s) failed: %v", name, err)
+			a.mu.Lock()
+			if a.models != nil {
+				delete(a.models, name)
+			}
+			a.mu.Unlock()
 			continue
 		}
 		a.mu.Lock()
@@ -444,7 +449,9 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 		apiMethodNotAllowed(w)
 		return
 	}
-	a.loadModels()
+	if len(a.models) == 0 {
+		a.loadModels()
+	}
 	result := make(map[string]map[string][]string, len(a.adapters))
 	a.mu.Lock()
 	for name, models := range a.models {

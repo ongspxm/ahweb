@@ -17,6 +17,7 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 		apiMethodNotAllowed(w)
 		return
 	}
+	a.loadModels()
 
 	type statusHarness struct {
 		Name      string `json:"name"`
@@ -36,6 +37,10 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.Lock()
 	roots := strings.FieldsFunc(a.config.GitRootRealDirs, func(r rune) bool { return r == '\n' || r == '\r' })
+	pollStatus := a.pollStatus
+	if pollStatus == "" {
+		pollStatus = "poll.session 0"
+	}
 	sessionCounts := make(map[string]int, len(a.sessions))
 	for folder, sessions := range a.sessions {
 		sessionCounts[folder] = len(sessions)
@@ -70,9 +75,10 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Version       string          `json:"version"`
 		Update        string          `json:"update"`
 		UpdateCommand string          `json:"update_command"`
+		PollStatus    string          `json:"poll_status"`
 		Harnesses     []statusHarness `json:"harnesses"`
 		Projects      []statusProject `json:"projects"`
-	}{Version: version, Update: notice, UpdateCommand: updateCommand, Harnesses: harnesses, Projects: projects})
+	}{Version: version, Update: notice, UpdateCommand: updateCommand, PollStatus: pollStatus, Harnesses: harnesses, Projects: projects})
 }
 
 const (

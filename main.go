@@ -86,6 +86,7 @@ type app struct {
 	unavailableAdapters    map[string]string
 	models                 map[string]map[string]harness.Model
 	config                 appConfig
+	pollStatus             string
 	pollJobs               chan pollJob
 	lastFolderCleanup      time.Time
 	lastOpened             struct {
