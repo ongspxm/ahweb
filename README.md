@@ -24,7 +24,7 @@ ahweb help
 ## API
 All fields required unless marked optional.
 - `GET /host` returns normalized instance name, used for identifying server.
-- `GET /api/status` returns `version`, update notice and command, harness readiness, and configured projects with worktrees and recognized session counts (`projects[].worktrees[].sessions`).
+- `GET /api/status` returns a bunch of server stats, including version and update notice, and also running status like harness availability.
 
 ### Config & models
 - `GET /api/config` returns all config as JSON; `GET /api/config?key=...` returns one value.

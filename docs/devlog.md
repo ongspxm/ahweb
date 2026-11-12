@@ -13,6 +13,52 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 
 potential backlog:
 - fork
+- webui git tab, dload patch
+- webui fil tab, uload files
+
+## 2026-11-12 DONE. avoid calling GetModels all the time
+api /models shouldnt call the GetModels() all the time
+because the adapters often are slow to GetModels() and /models is called everytime we refresh
+
+fix: GetModels() only called once on init, and everytime we refresh status
+other than that, we should only read the cached models list
+
+## 2026-11-12 DONE. webui svg use 16 background colors
+svg logo have only 4 colors, many clashes
+make 16 colors instead. left 4 choices, right 4 choices.
+
+## 2026-11-12 DONE. expose chat sessid in webui url
+we want the sessid so that we can use it to open session on native tui
+
+impl: When opening a chat in the webui, include ?sessid= into the url
+Clear the query parameter when starting a new chat.
+
+## 2026-11-12 DONE. claude permission mode
+if dangerously-skip-permission is disabled, edit cant even go thru
+so we have both permission flags on for claude instead
+dangerously-skip-permission if disabled, will rely on mode=auto
+
+## 2026-11-12 DONE. claude tool input details
+webui. when i load claude history, we only see tool name, no tool details.
+update adapter to read it for both live events and transcript reading
+
+## 2026-11-12 DONE. claude duplicate sessions
+sessions started on ahweb for claude adapter seems to be duplicated
+dig: claudeID and sessID differ, some have dashes, some doesnt.
+on the webui, we see duplicated session on the list.
+fix: we dedup transcript with the canonical ID, to skip IDs that we seen
+
+## 2026-11-12 DONE. run macOS service in user login session
+macOS LaunchDaemon lacked the login/keychain context used by agent credentials.
+Install ahweb as a user LaunchAgent to use login-session credentials.
+
+## 2026-11-12 DONE. show poll status in webui
+Status tab should show the same per-harness poll summary line as the server log.
+Return the cached poll.session line in /api/status and display it in the Status tab.
+
+## 2026-11-12 DONE. set TERM for macOS launchd
+on daemon darwin, we cant run alot of stuff cos TERM not set
+fix: set TERM=xterm in the launchd service environment
 
 ## 2026-11-11 DONE. render webui mermaid diagram
 we want to render mermaid diagrams on webui
