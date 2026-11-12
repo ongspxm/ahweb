@@ -7,14 +7,17 @@
 import { gfm, gfmHtml, micromark } from "/lib/markdown/markdown.js";
 
 // mermaid utils
-window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default" });
+window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true, theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default" });
 let mermaidID = 0;
 function _renderMermaid(source, diagram) {
-	const theme = document.documentElement.dataset.theme === "dark" ? "dark" : "default", renderID = diagram.renderID = (diagram.renderID || 0) + 1;
-	window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme });
-	window.mermaid.render(`ahweb-mermaid-${++mermaidID}`, source).then(({ svg }) => {
+	const theme = document.documentElement.dataset.theme === "dark" ? "dark" : "default", renderID = diagram.renderID = (diagram.renderID || 0) + 1, id = `ahweb-mermaid-${++mermaidID}`;
+	window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true, theme });
+	window.mermaid.render(id, source).then(({ svg }) => {
 		if (diagram.renderID === renderID) diagram.innerHTML = svg;
 	}).catch((err) => {
+		document.getElementById(id)?.remove();
+		document.getElementById(`d${id}`)?.remove();
+		document.getElementById(`i${id}`)?.remove();
 		if (diagram.renderID === renderID) diagram.textContent = `Could not render diagram: ${err.message}`;
 	});
 }
@@ -362,7 +365,7 @@ function renderSessList(f) {
 		if (!children.length) continue;
 		const details = document.createElement("details");
 		details.dataset.parent = s.sessid;
-		details.open = open.get(s.sessid) ?? true;
+		details.open = open.get(s.sessid) ?? false;
 		const summary = document.createElement("summary");
 		summary.textContent = `${children.length} child chat${children.length === 1 ? "" : "s"}`;
 		details.append(summary);
@@ -830,7 +833,7 @@ function apiLoadModels() {
 			eleModel.disabled = false;
 		});
 }
-
+window.apiLoadModels = apiLoadModels;
 {
 	const dialog = $("#cleanup-dialog"),
 		daysInput = $("#cleanup-days"),
@@ -1042,6 +1045,10 @@ function apiLoadSess(f, id) {
 	f = (f || eleDir.value).trim();
 	folder = f;
 	sessid = id;
+	const url = new URL(location.href);
+	if (id) url.searchParams.set("sessid", id);
+	else url.searchParams.delete("sessid");
+	history.replaceState(history.state, "", url);
 	renderReset();
 	if (id) {
 		const harness = chatInfo(folder, id)?.harness || "pi";
@@ -1443,7 +1450,7 @@ collapseBtn.addEventListener("click", () => {
 });
 
 apiLoadModels();
-window.apiLoadStatus?.();
+window.apiLoadStatus?.()?.then?.(() => apiLoadModels());
 setInterval(() => {
 	if (folder) htmx.trigger(eleSess, "refresh");
 }, 30_000);

@@ -10,6 +10,9 @@ function renderStatus(status) {
 		`To update, run ${status.update_command || "go install github.com/ongspxm/ahweb@latest"}.`;
 	statusView.append(version, update);
 
+	const pollStatus = document.createElement("p");
+	pollStatus.textContent = status.poll_status || "poll.session 0";
+
 	const harnesses = document.createElement("section"),
 		harnessTitle = document.createElement("h3"),
 		harnessRows = document.createElement("div");
@@ -43,6 +46,7 @@ function renderStatus(status) {
 	}
 	harnesses.append(harnessTitle, harnessRows);
 	statusView.append(harnesses);
+	statusView.append(pollStatus);
 
 	const projects = document.createElement("section"),
 		projectsTitle = document.createElement("h3"),
@@ -144,7 +148,7 @@ async function apiLoadStatus() {
 window.apiLoadStatus = apiLoadStatus;
 
 document.querySelector("#status-refresh").addEventListener("click", () => {
-	window.apiLoadStatus();
+	window.apiLoadStatus()?.then?.(() => window.apiLoadModels?.());
 });
 
 apiLoadStatus();
