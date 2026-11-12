@@ -127,15 +127,20 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		return nil, fmt.Errorf("could not read Claude sessions: %w", err)
 	}
 	var sessions []harness.SessionLite
+	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
 			continue
 		}
 		nativeID := strings.TrimSuffix(entry.Name(), ".jsonl")
+		canonicalID := sessionUUID(nativeID)
+		if seen[canonicalID] {
+			continue
+		}
 		localID := nativeID
 		cacheMu.Lock()
 		for id := range cache[realFolder] {
-			if sessionUUID(id) == nativeID {
+			if sessionUUID(id) == canonicalID {
 				localID = id
 				break
 			}
@@ -181,6 +186,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		}
 		f.Close()
 		if lite.FirstUserMsg != "" || lite.LastTimestampMs != 0 {
+			seen[canonicalID] = true
 			sessions = append(sessions, lite)
 		}
 	}
@@ -262,7 +268,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	if c.cmd != nil {
 		return errors.New("Claude session is busy")
 	}
-	args := []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"}
+	args := []string{"-p", "--dangerously-skip-permissions", "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"}
 	if len(images) > 0 {
 		args = append(args, "--input-format", "stream-json")
 	}
@@ -339,7 +345,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 				c.mu.Lock()
 				if e.Type == harness.EventToolStart && e.ToolCallID != "" {
 					for _, existing := range c.events {
-						if existing.Type == e.Type && existing.ToolCallID == e.ToolCallID {
+						if existing.Type == e.Type && existing.ToolCallID == e.ToolCallID && (e.Content == "" || existing.Content == e.Content) {
 							c.mu.Unlock()
 							return
 						}
@@ -393,7 +399,12 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 					} else if kind == "assistant" && blockType == "tool_use" {
 						name, _ := block["name"].(string)
 						id, _ := block["id"].(string)
-						_add(harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id})
+						input := ""
+						if value, ok := block["input"]; ok {
+							encoded, _ := json.Marshal(value)
+							input = string(encoded)
+						}
+						_add(harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, Content: input})
 					} else if image := imageDataURI(block); image != "" && kind == "assistant" {
 						_add(harness.Event{Type: harness.EventAssistant, Images: []string{image}})
 					}
@@ -549,7 +560,12 @@ func (a *Adapter) Poll(s *harness.Session) error {
 								case "tool_use":
 									name, _ := part["name"].(string)
 									id, _ := part["id"].(string)
-									events = append(events, harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, TimestampMs: timestamp})
+									toolInput := ""
+									if value, ok := part["input"]; ok {
+										encoded, _ := json.Marshal(value)
+										toolInput = string(encoded)
+									}
+									events = append(events, harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, Content: toolInput, TimestampMs: timestamp})
 								case "tool_result":
 									id, _ := part["tool_use_id"].(string)
 									failed, _ := part["is_error"].(bool)
