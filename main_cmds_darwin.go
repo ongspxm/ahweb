@@ -13,12 +13,8 @@ import (
 )
 
 const serviceLabel = "com.ongspxm.ahweb"
-const servicePlist = "/Library/LaunchDaemons/com.ongspxm.ahweb.plist"
 
 func serviceInstall(port int) error {
-	if err := requireAdmin(); err != nil {
-		return err
-	}
 	account, err := installUser()
 	if err != nil {
 		return err
@@ -27,39 +23,37 @@ func serviceInstall(port int) error {
 	if err != nil {
 		return fmt.Errorf("find ahweb executable: %w", err)
 	}
-	logDir := filepath.Join(account.HomeDir, "Library", "Logs", "ahweb")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return fmt.Errorf("create ahweb log directory: %w", err)
-	}
 	uid, err := strconv.Atoi(account.Uid)
 	if err != nil {
 		return fmt.Errorf("parse installing user id: %w", err)
 	}
-	gid, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		return fmt.Errorf("parse installing group id: %w", err)
+	gui := "gui/" + strconv.Itoa(uid)
+	agentDir := filepath.Join(account.HomeDir, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		return fmt.Errorf("create LaunchAgents directory: %w", err)
 	}
-	if err := os.Chown(logDir, uid, gid); err != nil {
-		return fmt.Errorf("set ahweb log directory owner: %w", err)
+	logDir := filepath.Join(account.HomeDir, "Library", "Logs", "ahweb")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("create ahweb log directory: %w", err)
 	}
+	servicePlist := filepath.Join(agentDir, serviceLabel+".plist")
 	path := os.Getenv("PATH")
 	fmt.Println("Copying over PATH to launchd service")
-	plist := launchdPlist(executable, account.Username, account.HomeDir, logDir, path, port)
-	if err := os.WriteFile(servicePlist, plist, 0644); err != nil {
-		return fmt.Errorf("write launchd service (run with sudo): %w", err)
+	if err := os.WriteFile(servicePlist, launchdPlist(executable, account.HomeDir, logDir, path, port), 0644); err != nil {
+		return fmt.Errorf("write launch agent: %w", err)
 	}
-	fmt.Printf("Wrote launchd service to %s\n", servicePlist)
-	if err := runServiceManager("launchctl", "enable", "system/"+serviceLabel); err != nil {
-		return err
-	}
-	return runServiceManager("launchctl", "bootstrap", "system", servicePlist)
+	// Reinstalling may leave the previous agent loaded.
+	_ = runServiceManager("launchctl", "bootout", gui, servicePlist)
+	fmt.Printf("Wrote launch agent to %s\n", servicePlist)
+	return runServiceManager("launchctl", "bootstrap", gui, servicePlist)
 }
 
 func serviceStatus() error {
-	if err := requireAdmin(); err != nil {
+	account, err := installUser()
+	if err != nil {
 		return err
 	}
-	return runServiceManager("launchctl", "print", "system/"+serviceLabel)
+	return runServiceManager("launchctl", "print", "gui/"+account.Uid+"/"+serviceLabel)
 }
 
 func serviceLogs() error {
@@ -72,58 +66,50 @@ func serviceLogs() error {
 }
 
 func serviceRestart() error {
-	if err := requireAdmin(); err != nil {
+	account, err := installUser()
+	if err != nil {
 		return err
 	}
-	return runServiceManager("launchctl", "kickstart", "-k", "system/"+serviceLabel)
+	return runServiceManager("launchctl", "kickstart", "-k", "gui/"+account.Uid+"/"+serviceLabel)
 }
 
 func serviceUninstall() error {
-	if err := requireAdmin(); err != nil {
+	account, err := installUser()
+	if err != nil {
 		return err
 	}
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return fmt.Errorf("parse installing user id: %w", err)
+	}
+	servicePlist := filepath.Join(account.HomeDir, "Library", "LaunchAgents", serviceLabel+".plist")
 	if _, err := os.Stat(servicePlist); os.IsNotExist(err) {
 		fmt.Println("ahweb service is not installed")
 		return nil
 	} else if err != nil {
 		return err
 	}
-	if err := runServiceManager("launchctl", "bootout", "system", servicePlist); err != nil {
+	if err := runServiceManager("launchctl", "bootout", "gui/"+strconv.Itoa(uid), servicePlist); err != nil {
 		return err
 	}
-	if err := runServiceManager("launchctl", "disable", "system/"+serviceLabel); err != nil {
-		return err
-	}
-	return os.Remove(servicePlist)
-}
-
-func requireAdmin() error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("this command needs admin permission; run with sudo")
+	if err := os.Remove(servicePlist); err != nil {
+		return fmt.Errorf("remove launch agent: %w", err)
 	}
 	return nil
 }
 
 func installUser() (*user.User, error) {
-	name := os.Getenv("SUDO_USER")
-	if name == "" && os.Geteuid() != 0 {
-		current, err := user.Current()
-		if err != nil {
-			return nil, fmt.Errorf("find current user: %w", err)
-		}
-		name = current.Username
+	if os.Geteuid() == 0 {
+		return nil, fmt.Errorf("run this command as your logged-in user, without sudo")
 	}
-	if name == "" || name == "root" {
-		return nil, fmt.Errorf("could not identify the installing user; use sudo ahweb install")
-	}
-	account, err := user.Lookup(name)
+	account, err := user.Current()
 	if err != nil {
-		return nil, fmt.Errorf("find installing user %q: %w", name, err)
+		return nil, fmt.Errorf("find current user: %w", err)
 	}
 	return account, nil
 }
 
-func launchdPlist(executable, username, home, logDir, path string, port int) []byte {
+func launchdPlist(executable, home, logDir, path string, port int) []byte {
 	var b bytes.Buffer
 	write := func(value string) {
 		_ = xml.EscapeText(&b, []byte(value))
@@ -137,13 +123,11 @@ func launchdPlist(executable, username, home, logDir, path string, port int) []b
 	write(executable)
 	b.WriteString(`</string><string>--port</string><string>`)
 	write(strconv.Itoa(port))
-	b.WriteString(`</string></array><key>UserName</key><string>`)
-	write(username)
-	b.WriteString(`</string><key>EnvironmentVariables</key><dict><key>HOME</key><string>`)
+	b.WriteString(`</string></array><key>EnvironmentVariables</key><dict><key>HOME</key><string>`)
 	write(home)
 	b.WriteString(`</string><key>PATH</key><string>`)
 	write(path)
-	b.WriteString(`</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>`)
+	b.WriteString(`</string><key>TERM</key><string>xterm</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>`)
 	write(filepath.Join(logDir, "stdout.log"))
 	b.WriteString(`</string><key>StandardErrorPath</key><string>`)
 	write(filepath.Join(logDir, "stderr.log"))
