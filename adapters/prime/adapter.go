@@ -290,7 +290,6 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		for scanner.Scan() {
 			var entry struct {
 				Type    string `json:"type"`
-				Name    string `json:"name"`
 				Message struct {
 					Role      string          `json:"role"`
 					Content   json.RawMessage `json:"content"`
@@ -299,9 +298,6 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 			}
 			if json.Unmarshal(scanner.Bytes(), &entry) != nil {
 				continue
-			}
-			if entry.Type == "session_info" {
-				s.Name = entry.Name
 			}
 			if entry.Type == "message" {
 				hasMessage = true
@@ -638,6 +634,74 @@ func (a *Adapter) Delete(s *harness.Session) error {
 
 // === session fns
 
+type primeTree struct {
+	LeafID    *string `json:"leafId"`
+	FlatNodes []struct {
+		Entry struct {
+			ID       string  `json:"id"`
+			ParentID *string `json:"parentId"`
+			Type     string  `json:"type"`
+			Message  struct {
+				Role string `json:"role"`
+			} `json:"message"`
+		} `json:"entry"`
+	} `json:"flatNodes"`
+}
+
+func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
+	conn, err := a.conn(s)
+	if err != nil {
+		return err
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	var state struct {
+		IsStreaming  bool `json:"isStreaming"`
+		IsCompacting bool `json:"isCompacting"`
+	}
+	if err := conn.call("get_state", nil, &state); err != nil {
+		return err
+	}
+	if state.IsStreaming || state.IsCompacting {
+		return errors.New("Prime session is busy")
+	}
+	var tree primeTree
+	if err := conn.call("get_session_tree", nil, &tree); err != nil {
+		return err
+	}
+	var parent *string
+	found := false
+	for _, node := range tree.FlatNodes {
+		if node.Entry.ID == rewindID && node.Entry.Type == "message" && node.Entry.Message.Role == "user" {
+			parent, found = node.Entry.ParentID, true
+			break
+		}
+	}
+	if !found {
+		return errors.New("Prime rewind target was not found")
+	}
+	var result struct {
+		Cancelled bool `json:"cancelled"`
+	}
+	if err := conn.call("navigate_tree", map[string]any{"targetId": rewindID, "summarize": false}, &result); err != nil {
+		return err
+	}
+	if result.Cancelled {
+		return errors.New("Prime rewind was cancelled")
+	}
+	if err := conn.call("get_session_tree", nil, &tree); err != nil {
+		return err
+	}
+	if (parent == nil) != (tree.LeafID == nil) || parent != nil && *parent != *tree.LeafID {
+		return errors.New("Prime rewind did not reach the requested parent")
+	}
+	conn.MsgCursor = 0
+	s.Mu.Lock()
+	s.DoFullHistory = true
+	s.Mu.Unlock()
+	return nil
+}
+
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	s.Mu.Lock()
 	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
@@ -740,13 +804,49 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		return err
 	}
 	messages := messagesResponse.Messages
+	var tree primeTree
+	if err := conn.call("get_session_tree", nil, &tree); err != nil {
+		return err
+	}
+	byID := make(map[string]int, len(tree.FlatNodes))
+	for i, node := range tree.FlatNodes {
+		byID[node.Entry.ID] = i
+	}
+	var branch []string
+	for id := tree.LeafID; id != nil; {
+		i, ok := byID[*id]
+		if !ok {
+			break
+		}
+		entry := tree.FlatNodes[i].Entry
+		if entry.Type == "message" {
+			branch = append(branch, entry.ID)
+		}
+		id = entry.ParentID
+	}
+	ids := make([]string, len(messages))
+	if len(branch) == len(messages) {
+		matched := true
+		for i, id := range branch {
+			j := len(branch) - 1 - i
+			if tree.FlatNodes[byID[id]].Entry.Message.Role != messages[j].Role {
+				matched = false
+				break
+			}
+			ids[j] = id
+		}
+		if !matched {
+			clear(ids)
+		}
+	}
 	rebuild := full || len(messages) < conn.MsgCursor
 	start := conn.MsgCursor
 	if rebuild {
 		start = 0
 	}
 	events := make([]harness.Event, 0)
-	for _, message := range messages[start:] {
+	for i := start; i < len(messages); i++ {
+		message := messages[i]
 		if message.Role == "custom" {
 			continue
 		}
@@ -806,7 +906,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			events = append(events, harness.Event{Type: harness.EventToolEnd, ToolName: message.ToolName, ToolCallID: message.ToolCallID, Content: strings.TrimSpace(result), Images: images, ToolFailed: message.IsError, TimestampMs: timestamp})
 		case "user":
 			if content = strings.TrimSpace(content); content != "" || len(images) > 0 {
-				events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp})
+				events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp, RewindID: ids[i]})
 			}
 		case "assistant":
 			if content = strings.TrimSpace(content); content != "" || len(images) > 0 {
@@ -848,9 +948,10 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	} else {
 		s.Events = append(s.Events, events...)
 	}
-	if s.FirstUserMsg == "" {
+	if rebuild || s.FirstUserMsg == "" {
+		s.FirstUserMsg = ""
 		for _, event := range events {
-			if event.Type == harness.EventUser && event.Content != "" {
+			if event.Type == harness.EventUser {
 				s.FirstUserMsg = event.Content
 				break
 			}

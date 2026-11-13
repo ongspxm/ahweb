@@ -27,6 +27,7 @@ type Event struct {
 	ToolFailed  bool      `json:"tool_failed,omitempty"`
 	TimestampMs int64     `json:"timestamp,omitempty"`
 	Model       string    `json:"model,omitempty"`
+	RewindID    string    `json:"rewind_id,omitempty"`
 }
 
 type Model struct {
@@ -39,19 +40,19 @@ type SessionLite struct {
 	ID              string
 	RealPath        string
 	Harness         string
-	Name            string
 	FirstUserMsg    string
 	LastTimestampMs int64
 	ParentSessID    string
 }
 type Session struct {
 	SessionLite
-	Events     []Event
-	Mu         sync.Mutex
-	OpMu       sync.Mutex
-	IsDeleted  bool
-	IsDeleting bool
-	IsStopping bool
+	Events      []Event
+	Mu          sync.Mutex
+	OpMu        sync.Mutex
+	IsDeleted   bool
+	IsDeleting  bool
+	IsStopping  bool
+	IsRewinding bool
 
 	BusyMsg bool
 	BusyCli bool
@@ -78,10 +79,22 @@ type Session struct {
 	ContextWindow   int64
 }
 
+
 func (s *Session) GetIsBusy() bool {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
-	return s.BusyMsg || s.BusyCli || s.QueuedMsg != ""
+	return s.GetIsBusyLocked()
+}
+
+// these xxxLocked fns expect the fn to be called after the s.Mu is locked
+func (s *Session) GetIsBusyLocked() bool {
+	return s.BusyMsg || s.BusyCli || s.QueuedMsg != "" || s.IsRewinding
+}
+func (s *Session) GetCanRewindLocked() bool {
+	return !s.IsDeleted && !s.IsDeleting && !s.IsStopping && !s.BusyMsg && !s.BusyCli && s.QueuedMsg == "" && !s.NeedsFirstPrompt
+}
+func (s *Session) GetStatsMapLocked() map[string]any {
+	return map[string]any{"full_input_tokens": s.FullInputToken, "full_output_tokens": s.FullOutputToken, "cache_read_tokens": s.CacheReadToken, "cache_write_tokens": s.CacheWriteToken, "full_cost": s.FullCost, "context_tokens": s.ContextTokens, "context_window": s.ContextWindow}
 }
 
 // === then Adapter
@@ -96,9 +109,10 @@ type Adapter interface {
 	CanDelete() bool
 	Delete(*Session) error
 	SendPrompt(s *Session) error
-	// Poll() refreshes the session title/first user message, stats, events, and other state.
+	// Poll() refreshes the first user message, stats, events, and other state.
 	// Poll() should (if possible) do partial msg read, unless s.DoFullHistory=true, then do full read
 	Poll(s *Session) error
+	Rewind(s *Session, rewindID string) error
 	Stop(s *Session) error
 	CleanUp(*Session) error
 }
@@ -122,6 +136,9 @@ func (DefaultAdapter) SendPrompt(*Session) error {
 }
 func (DefaultAdapter) Poll(*Session) error {
 	return errors.New("DefaultAdapter.Poll is not implemented")
+}
+func (DefaultAdapter) Rewind(*Session, string) error {
+	return errors.New("session rewind is not supported")
 }
 func (DefaultAdapter) Stop(*Session) error {
 	return errors.New("DefaultAdapter.Stop is not implemented")

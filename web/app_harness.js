@@ -182,6 +182,21 @@ function nextEventSeq(events) {
 	return max + 1;
 }
 
+function reconcileChildren(parent, desired) {
+	for (let i = 0; i < desired.length; i++) {
+		const current = parent.childNodes[i];
+		if (current !== desired[i]) parent.insertBefore(desired[i], current || null);
+	}
+	while (parent.childNodes.length > desired.length) parent.lastChild.remove();
+}
+
+function emptyText(parent, text) {
+	return (
+		[...parent.childNodes].find((node) => node.nodeType === Node.TEXT_NODE) ||
+		document.createTextNode(text)
+	);
+}
+
 // === polling stuff
 const polling = {};
 function stopPollSess(f, id) {
@@ -262,8 +277,8 @@ function renderStats(stats) {
 	eleUsage.textContent = parts.join("\u00a0\u00a0\u00a0");
 }
 
-function renderSessCard(chat) {
-	const button = [...eleSess.querySelectorAll("button[data-sessid]")].find(
+function renderSessCard(chat, button) {
+	button ||= [...eleSess.querySelectorAll("button[data-sessid]")].find(
 		(button) => button.dataset.sessid === chat.sessid,
 	);
 	if (!button) return false;
@@ -288,25 +303,21 @@ function renderSessCard(chat) {
 function renderSessList(f) {
 	const path = cachePath(f),
 		list = Object.values(CACHE.chats[path] || {});
-	const open = new Map(
-		[...eleSess.querySelectorAll("details[data-parent]")].map((d) => [
-			d.dataset.parent,
-			d.open,
-		]),
-	);
 	eleFolder.textContent = path;
 	eleFolder.title = path;
 	eleCount.textContent = `${list.length} chat${list.length === 1 ? "" : "s"}`;
-	eleSess.replaceChildren();
-	const fresh = document.createElement("button");
-	fresh.className = "outline secondary";
-	fresh.textContent = "+ New chat";
-	fresh.addEventListener("click", () => {
-		location.hash = "#chat";
-		apiLoadSess(folder, null);
-		elePrompt.focus();
-	});
-	eleSess.append(fresh);
+	let fresh = eleSess.querySelector(":scope > [data-new-chat]");
+	if (!fresh) {
+		fresh = document.createElement("button");
+		fresh.dataset.newChat = "";
+		fresh.className = "outline secondary";
+		fresh.textContent = "+ New chat";
+		fresh.addEventListener("click", () => {
+			location.hash = "#chat";
+			apiLoadSess(folder, null);
+			elePrompt.focus();
+		});
+	}
 	const _sort = (a, b) => {
 		const at = Number(a.tstamp) || 0,
 			bt = Number(b.tstamp) || 0;
@@ -331,55 +342,71 @@ function renderSessList(f) {
 		if (!groups.has(root.sessid)) groups.set(root.sessid, []);
 		if (root.sessid !== s.sessid) groups.get(root.sessid).push(s);
 	}
+	const cards = new Map(
+		[...eleSess.querySelectorAll(".session-row")].map((row) => [
+			row.querySelector("button[data-sessid]")?.dataset.sessid,
+			row,
+		]),
+	);
 	const _card = (s) => {
-		const row = document.createElement("div"),
-			b = document.createElement("button");
-		row.className = "session-row";
+		let row = cards.get(s.sessid);
+		if (!row) {
+			row = document.createElement("div");
+			row.className = "session-row";
+			const b = document.createElement("button"),
+				name = document.createElement("span");
+			b.dataset.sessid = s.sessid;
+			name.className = "session-name";
+			b.append(name);
+			b.addEventListener("click", () => {
+				location.hash = "#chat";
+				apiLoadSess(folder, b.dataset.sessid);
+				elePrompt.focus();
+			});
+			row.append(b);
+			cards.set(s.sessid, row);
+		}
+		const b = row.querySelector("button");
 		b.className = s.sessid === sessid ? "" : "outline";
 		b.title = s.sessid;
-		b.dataset.sessid = s.sessid;
-		const name = document.createElement("span");
-		name.className = "session-name";
-		name.textContent = `${s.harness ? `${s.harness}. ` : ""}${s.name || s.sessid.slice(0, 8)}`;
-		b.append(name);
-		const pending = Number(s.tstamp) > Number(s.last_opened);
-		if (s.busy || pending) {
-			const status = document.createElement("span");
-			status.className = `status${s.busy ? " busy" : ""}`;
-			status.setAttribute("role", "img");
-			status.setAttribute("aria-label", s.busy ? "Busy" : "Pending message");
-			row.append(status);
-		}
-		b.addEventListener("click", () => {
-			location.hash = "#chat";
-			apiLoadSess(folder, s.sessid);
-			elePrompt.focus();
-		});
-		row.prepend(b);
+		renderSessCard(s, b);
 		return row;
 	};
+	const desired = [fresh];
 	for (const s of list
 		.filter((item) => _root(item).sessid === item.sessid)
 		.sort(_sort)) {
-		eleSess.append(_card(s));
+		desired.push(_card(s));
 		const children = (groups.get(s.sessid) || []).sort(_sort);
 		if (!children.length) continue;
-		const details = document.createElement("details");
-		details.dataset.parent = s.sessid;
-		details.open = open.get(s.sessid) ?? false;
-		const summary = document.createElement("summary");
-		summary.textContent = `${children.length} child chat${children.length === 1 ? "" : "s"}`;
-		details.append(summary);
-		for (const child of children) {
-			const row = document.createElement("div");
-			row.className = "session-child";
-			row.append(_card(child));
-			details.append(row);
+		let details = [...eleSess.querySelectorAll("details[data-parent]")].find(
+			(details) => details.dataset.parent === s.sessid,
+		);
+		if (!details) {
+			details = document.createElement("details");
+			details.dataset.parent = s.sessid;
+			details.append(document.createElement("summary"));
 		}
-		eleSess.append(details);
+		const summary = details.querySelector("summary");
+		summary.textContent = `${children.length} child chat${children.length === 1 ? "" : "s"}`;
+		const childRows = [];
+		for (const child of children) {
+			let row = [...details.children].find(
+				(row) => row.dataset.sessid === child.sessid,
+			);
+			if (!row) row = document.createElement("div");
+			row.className = "session-child";
+			row.dataset.sessid = child.sessid;
+			reconcileChildren(row, [_card(child)]);
+			childRows.push(row);
+		}
+		reconcileChildren(details, [summary, ...childRows]);
+		desired.push(details);
 	}
-	if (!list.length)
-		eleSess.append(document.createTextNode("No chats in this worktree"));
+	if (!list.length) {
+		desired.push(emptyText(eleSess, "No chats in this worktree"));
+	}
+	reconcileChildren(eleSess, desired);
 	if (window.lucide) window.lucide.createIcons();
 }
 
@@ -429,7 +456,7 @@ function renderEvents(list) {
 			.join(" · ");
 	}
 
-	function _card(role, meta) {
+	function _card(role, meta, rewindID = "") {
 		const a = document.createElement("article");
 		a.classList.add(
 			role === "YOU"
@@ -441,9 +468,7 @@ function renderEvents(list) {
 						: "assistant",
 		);
 		if (role === "THINKING") a.classList.add("thinking");
-		const h = document.createElement(
-			role === "THINKING" ? "summary" : "header",
-		);
+		const h = document.createElement(role === "THINKING" ? "summary" : "header");
 		h.className = "row";
 		const label = document.createElement("div");
 		const strong = document.createElement("strong");
@@ -452,6 +477,16 @@ function renderEvents(list) {
 		small.textContent = meta || "";
 		label.append(strong, document.createTextNode(" "), small);
 		h.append(label);
+		if (role === "YOU" && rewindID) {
+			const button = document.createElement("button");
+			button.className = "outline secondary";
+			button.type = "button";
+			button.title = "Rewind to this message";
+			button.setAttribute("aria-label", button.title);
+			button.innerHTML = '<i data-lucide="rotate-ccw"></i>';
+			button.addEventListener("click", () => apiRewind(rewindID, button));
+			h.append(button);
+		}
 		const body = document.createElement("div");
 		if (role === "THINKING") {
 			const details = document.createElement("details");
@@ -597,7 +632,7 @@ function renderEvents(list) {
 		if (e.type === "user") {
 			setError("");
 			clearQueuedPrompts();
-			const b = _card("YOU", _messageMeta(e));
+			const b = _card("YOU", _messageMeta(e), e.rewind_id);
 			b.textContent = e.content || "";
 			_images(b, e);
 			_closeEvents();
@@ -651,6 +686,7 @@ function renderEvents(list) {
 	}
 
 	for (const e of list) _renderEvent(e);
+	if (window.lucide) window.lucide.createIcons();
 	if (chatPinned) eleChat.scrollTop = eleChat.scrollHeight;
 }
 
@@ -680,55 +716,84 @@ function renderReset() {
 }
 
 function renderProjectLists() {
-	eleProjects.replaceChildren();
+	const projects = new Map(
+		[...eleProjects.querySelectorAll(":scope > .project-row")].map((row) => [
+			row.dataset.path,
+			row,
+		]),
+	);
+	const projectRows = [];
 	for (const root of projectRoots) {
-		const row = document.createElement("div");
-		row.className = "project-row";
-		const b = document.createElement("button");
+		let row = projects.get(root);
+		if (!row) {
+			row = document.createElement("div");
+			row.className = "project-row";
+			row.dataset.path = root;
+			const b = document.createElement("button"),
+				remove = document.createElement("button");
+			b.addEventListener("click", () => apiSelectProject(b.dataset.path));
+			remove.className = "outline secondary project-remove";
+			remove.type = "button";
+			remove.innerHTML = '<i data-lucide="x"></i>';
+			remove.addEventListener("click", async () => {
+				const path = row.dataset.path;
+				if (
+					!confirm(
+						`Remove this project from ahweb? This won’t delete its files.\n\n${path}`,
+					)
+				)
+					return;
+				try {
+					const r = await fetch(`/api/delproject?folder=${enc(path)}`, {
+						method: "POST",
+					}),
+						body = await r.json();
+					if (!r.ok) throw new Error(body.error || "Could not remove project");
+					setError("");
+					await apiLoadProjects();
+				} catch (err) {
+					setError(err.message);
+				}
+			});
+			row.append(b, remove);
+		}
+		const b = row.querySelector("button:first-child"),
+			remove = row.querySelector("button:last-child");
 		b.className = root === selectedProject ? "" : "outline";
+		b.dataset.path = root;
 		b.textContent = root;
 		b.title = root;
-		b.addEventListener("click", () => apiSelectProject(root));
-		const remove = document.createElement("button");
-		remove.className = "outline secondary project-remove";
-		remove.type = "button";
-		remove.innerHTML = '<i data-lucide="x"></i>';
 		remove.title = `Remove ${root}`;
 		remove.setAttribute("aria-label", `Remove project ${root}`);
-		remove.addEventListener("click", async () => {
-			if (
-				!confirm(
-					`Remove this project from ahweb? This won’t delete its files.\n\n${root}`,
-				)
-			)
-				return;
-			try {
-				const r = await fetch(`/api/delproject?folder=${enc(root)}`, {
-					method: "POST",
-				});
-				const body = await r.json();
-				if (!r.ok) throw new Error(body.error || "Could not remove project");
-				setError("");
-				await apiLoadProjects();
-			} catch (err) {
-				setError(err.message);
-			}
-		});
-		row.append(b, remove);
-		eleProjects.append(row);
+		projectRows.push(row);
 	}
-	if (!projectRoots.length)
-		eleProjects.append(document.createTextNode("No projects yet"));
-	eleWorktrees.replaceChildren();
+	if (!projectRoots.length) {
+		projectRows.push(emptyText(eleProjects, "No projects yet"));
+	}
+	reconcileChildren(eleProjects, projectRows);
+	const worktrees = new Map(
+		[...eleWorktrees.querySelectorAll(":scope > .worktree-row")].map((row) => [
+			row.dataset.path,
+			row,
+		]),
+	);
+	const worktreeRows = [];
 	for (const worktree of worktreePaths) {
-		const row = document.createElement("div");
-		row.className = "worktree-row";
-		const b = document.createElement("button");
+		const path = worktree.dirname;
+		let row = worktrees.get(path);
+		if (!row) {
+			row = document.createElement("div");
+			row.className = "worktree-row";
+			row.dataset.path = path;
+			const b = document.createElement("button");
+			b.addEventListener("click", () => apiSelectWorktree(b.dataset.path));
+			row.append(b);
+		}
+		const b = row.querySelector("button");
 		b.className = worktree.dirname === selectedWorktree ? "" : "outline";
+		b.dataset.path = path;
 		b.textContent = worktree.branch || worktree.dirname;
 		b.title = worktree.dirname;
-		b.addEventListener("click", () => apiSelectWorktree(worktree.dirname));
-		row.append(b);
 		const chats = Object.values(CACHE.chats[cachePath(worktree.dirname)] || {});
 		const busy = chats.some((chat) => chat.busy),
 			pending = chats.some(
@@ -737,16 +802,21 @@ function renderProjectLists() {
 					Number(chat.tstamp) > Number(chat.last_opened),
 			);
 		if (busy || pending) {
-			const status = document.createElement("span");
+			let status = row.querySelector(":scope > .status");
+			if (!status) {
+				status = document.createElement("span");
+				row.append(status);
+			}
 			status.className = `status${busy ? " busy" : ""}`;
 			status.setAttribute("role", "img");
 			status.setAttribute("aria-label", busy ? "Busy" : "Pending message");
-			row.append(status);
-		}
-		eleWorktrees.append(row);
+		} else row.querySelector(":scope > .status")?.remove();
+		worktreeRows.push(row);
 	}
-	if (selectedProject && !worktreePaths.length)
-		eleWorktrees.append(document.createTextNode("No worktrees"));
+	if (selectedProject && !worktreePaths.length) {
+		worktreeRows.push(emptyText(eleWorktrees, "No worktrees"));
+	}
+	reconcileChildren(eleWorktrees, worktreeRows);
 	const _basename = (path) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 	eleBreadcrumbProject.textContent = selectedProject ? _basename(selectedProject) : "(empty)";
 	const selected = worktreePaths.find((worktree) => worktree.dirname === selectedWorktree);
@@ -757,6 +827,46 @@ function renderProjectLists() {
 }
 
 // === api calls
+async function apiRewind(rewindID, button) {
+	if (!sessid || button.disabled) return;
+	const f = folder,
+		id = sessid,
+		harness = currentHarness(),
+		icon = button.innerHTML;
+	stopPollSess(f, id);
+	button.disabled = true;
+	button.innerHTML = '<i data-lucide="loader-circle" aria-label="Rewinding"></i>';
+	if (window.lucide) window.lucide.createIcons();
+	try {
+		const params = new URLSearchParams({ folder: f, sessid: id, harness, rewind_id: rewindID });
+		const r = await fetch(`/api/rewind?${params}`, { method: "POST" });
+		const b = await r.json();
+		if (!r.ok) throw new Error(b.error || "Could not rewind");
+		const chat = updateChat(f, { ...b, sessid: id, resetEvents: true });
+		if (f === folder && id === sessid) {
+			setError("");
+			renderReset();
+			renderEvents(b.events || []);
+			renderBusy(chat.busy);
+			renderQueuedPrompts(chat.queued);
+			renderStats(chat.stats);
+			elePrompt.value = b.prompt || "";
+			promptImages = (b.prompt_images || [])
+				.filter((uri) => typeof uri === "string" && uri.startsWith("data:image/"))
+				.map((uri, i) => ({ file: { name: `Image ${i + 1}` }, uri }));
+			renderPromptImages();
+			growPrompt();
+		}
+		apiLoadSessList(f);
+	} catch (err) {
+		startPollSess(f, id);
+		setError(err.message);
+	} finally {
+		button.disabled = false;
+		button.innerHTML = icon;
+		if (window.lucide) window.lucide.createIcons();
+	}
+}
 function apiLoadConfig(harnesses) {
 	const keys = harnesses.flatMap((h) => [
 		`${h}_default_model`,
@@ -1285,7 +1395,7 @@ eleHarness.addEventListener("change", renderHarnessDetails);
 async function addPromptImages(files) {
 	for (const file of files) {
 		if (typeof file === "string" && file.startsWith("data:image/")) {
-			promptImages.push({ file: null, uri: file });
+			promptImages.push({ file: { name: `Image ${promptImages.length + 1}` }, uri: file });
 			continue;
 		}
 		if (!file?.type.startsWith("image/")) continue;
@@ -1301,30 +1411,32 @@ async function addPromptImages(files) {
 			setError(err.message);
 		}
 	}
-	const _render = () => {
-		eleImagePreview.replaceChildren();
-		promptImages.forEach(({ file, uri }, index) => {
-			const item = document.createElement("span");
-			item.className = "image-preview-item";
-			const image = document.createElement("img");
-			image.src = uri;
-			image.alt = file?.name || "Queued image";
-			const remove = document.createElement("button");
-			remove.className = "secondary outline";
-			remove.textContent = "×";
-			remove.setAttribute("aria-label", `Remove ${file?.name || "queued image"}`);
-			remove.addEventListener("click", () => {
-				promptImages.splice(index, 1);
-				_render();
-			});
-			item.append(image, remove);
-			eleImagePreview.append(item);
-		});
-		eleImagePreview.hidden = promptImages.length === 0;
-	};
-	_render();
+	renderPromptImages();
 	if (promptImages.length) setError("");
 }
+
+function renderPromptImages() {
+	eleImagePreview.replaceChildren();
+	promptImages.forEach(({ file, uri }, index) => {
+		const item = document.createElement("span");
+		item.className = "image-preview-item";
+		const image = document.createElement("img");
+		image.src = uri;
+		image.alt = file.name;
+		const remove = document.createElement("button");
+		remove.className = "secondary outline";
+		remove.textContent = "×";
+		remove.setAttribute("aria-label", `Remove ${file.name}`);
+		remove.addEventListener("click", () => {
+			promptImages.splice(index, 1);
+			renderPromptImages();
+		});
+		item.append(image, remove);
+		eleImagePreview.append(item);
+	});
+	eleImagePreview.hidden = promptImages.length === 0;
+}
+
 
 eleImageInput.addEventListener("change", async () => {
 	await addPromptImages(eleImageInput.files || []);

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ongspxm/ahweb/harness"
@@ -71,7 +72,6 @@ func (a *app) listFolderSessions(folder string) error {
 					existing.Mu.Unlock()
 					continue
 				}
-				existing.Name = s.Name
 				existing.FirstUserMsg = s.FirstUserMsg
 				existing.LastTimestampMs = s.LastTimestampMs
 				existing.ParentSessID = s.ParentSessID
@@ -86,9 +86,6 @@ func (a *app) listFolderSessions(folder string) error {
 }
 
 func sessionName(s harness.SessionLite) string {
-	if s.Name != "" {
-		return s.Name
-	}
 	name := []rune(strings.TrimSpace(s.FirstUserMsg))
 	if len(name) > 140 {
 		name = name[:140]
@@ -220,10 +217,105 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	queued := s.QueuedMsg
 	queuedImages := s.QueuedImages
 	name := sessionName(s.SessionLite)
-	stats := map[string]any{"full_input_tokens": s.FullInputToken, "full_output_tokens": s.FullOutputToken, "cache_read_tokens": s.CacheReadToken, "cache_write_tokens": s.CacheWriteToken, "full_cost": s.FullCost, "context_tokens": s.ContextTokens, "context_window": s.ContextWindow}
+	stats := s.GetStatsMapLocked()
 	s.Mu.Unlock()
 
 	apiWriteJSON(w, http.StatusOK, map[string]any{"sessid": sessID, "name": name, "events": events, "busy": busy, "queued": queued, "queued_images": queuedImages, "stats": stats, "tstamp": tstamp, "last_opened": lastOpened})
+}
+
+func (a *app) handleRewind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		apiMethodNotAllowed(w)
+		return
+	}
+	q := r.URL.Query()
+	folder, err := getAbsPath(q.Get("folder"))
+	if err != nil {
+		apiWriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sessID, harnessName, rewindID := strings.TrimSpace(q.Get("sessid")), strings.TrimSpace(q.Get("harness")), strings.TrimSpace(q.Get("rewind_id"))
+	if sessID == "" || harnessName == "" || rewindID == "" {
+		apiWriteError(w, http.StatusBadRequest, "sessid, harness, and rewind_id are required")
+		return
+	}
+
+	// chk that we can perform rewind
+	a.mu.Lock()
+	s := a.sessionLocked(folder, harnessName, sessID)
+	adapter := a.adapters[harnessName]
+	a.mu.Unlock()
+	if s == nil {
+		apiWriteError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if adapter == nil {
+		apiWriteError(w, http.StatusBadRequest, "unsupported harness")
+		return
+	}
+	if a.pollJobs == nil {
+		apiWriteError(w, http.StatusServiceUnavailable, "poll workers are not running")
+		return
+	}
+	s.Mu.Lock()
+	if s.IsRewinding || !s.GetCanRewindLocked() {
+		s.Mu.Unlock()
+		apiWriteError(w, http.StatusConflict, "cannot rewind a busy session")
+		return
+	}
+
+	// find the rewind target and send rewind polljob over
+	var prompt string
+	var promptImages []string
+	found := false
+	for _, event := range s.Events {
+		if event.RewindID == rewindID && event.Type == harness.EventUser {
+			prompt, promptImages, found = event.Content, append([]string{}, event.Images...), true
+			break
+		}
+	}
+	if !found {
+		s.Mu.Unlock()
+		apiWriteError(w, http.StatusBadRequest, "rewind user event not found")
+		return
+	}
+	s.IsRewinding = true
+	s.Mu.Unlock()
+	result, done := make(chan error, 1), &sync.WaitGroup{}
+	done.Add(1)
+	select {
+	case a.pollJobs <- pollJob{session: s, done: done, rewindResult: result, rewindID: rewindID}:
+	case <-r.Context().Done():
+		s.Mu.Lock()
+		s.IsRewinding = false
+		s.Mu.Unlock()
+		return
+	}
+
+	// rewind poll job is done
+	select {
+	case err = <-result:
+		done.Wait()
+	case <-r.Context().Done():
+		return
+	}
+	if err != nil {
+		apiWriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	type apiEvent struct {
+		harness.Event
+		Seq int64 `json:"seq"`
+	}
+	events := make([]apiEvent, 0, len(s.Events))
+	for i, event := range s.Events {
+		events = append(events, apiEvent{Event: event, Seq: int64(i)})
+	}
+	stats := s.GetStatsMapLocked()
+	busy := s.GetIsBusyLocked()
+	apiWriteJSON(w, http.StatusOK, map[string]any{"sessid": sessID, "prompt": prompt, "prompt_images": promptImages, "name": sessionName(s.SessionLite), "events": events, "busy": busy, "queued": s.QueuedMsg, "queued_images": s.QueuedImages, "stats": stats, "tstamp": s.LastTimestampMs})
 }
 
 func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -254,9 +346,9 @@ func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Mu.Lock()
-	if s.IsDeleted || s.IsDeleting || s.IsStopping {
+	if s.IsDeleted || s.IsDeleting || s.IsStopping || s.IsRewinding {
 		s.Mu.Unlock()
-		apiWriteError(w, http.StatusConflict, "session is being deleted or stopped")
+		apiWriteError(w, http.StatusConflict, "session is being deleted, stopped, or rewound")
 		return
 	}
 	s.IsStopping = true
@@ -445,9 +537,9 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 
 	// update the QueuedMsg + other stuff
 	s.Mu.Lock()
-	if s.IsDeleted || s.IsDeleting || s.IsStopping {
+	if s.IsDeleted || s.IsDeleting || s.IsStopping || s.IsRewinding {
 		s.Mu.Unlock()
-		apiWriteError(w, http.StatusConflict, "session is being deleted or stopped")
+		apiWriteError(w, http.StatusConflict, "session is being deleted, stopped, or rewound")
 		return
 	}
 	if s.QueuedMsg != "" && strings.TrimSpace(req.Prompt) != "" {

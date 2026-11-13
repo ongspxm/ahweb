@@ -130,7 +130,6 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		var result struct {
 			Data []struct {
 				ID        string `json:"id"`
-				Name      string `json:"name"`
 				Preview   string `json:"preview"`
 				UpdatedAt int64  `json:"updatedAt"`
 				ParentID  string `json:"parentThreadId"`
@@ -144,7 +143,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 			if mappedThreads[thread.ID] {
 				continue
 			}
-			lite := harness.SessionLite{ID: thread.ID, RealPath: realFolder, Harness: "codex", Name: thread.Name, FirstUserMsg: thread.Preview, LastTimestampMs: thread.UpdatedAt * 1000, ParentSessID: thread.ParentID}
+			lite := harness.SessionLite{ID: thread.ID, RealPath: realFolder, Harness: "codex", FirstUserMsg: thread.Preview, LastTimestampMs: thread.UpdatedAt * 1000, ParentSessID: thread.ParentID}
 			sessions = append(sessions, lite)
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
@@ -310,6 +309,26 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	return err
 }
 
+func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
+	c, err := getConn(s)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	threadID, isWriter := c.codexThreadID, c.isWriter
+	c.mu.Unlock()
+	if !isWriter {
+		if _, _, err := processRPC.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.isWriter = true
+		c.mu.Unlock()
+	}
+	_, _, err = processRPC.call("thread/revert", map[string]any{"threadId": threadID, "beforeTurnId": rewindID})
+	return err
+}
+
 // === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
@@ -431,7 +450,48 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		return out.String()
 	}
 
-	_convert := func(item map[string]any, timestamp int64) []harness.Event {
+	_itemJSON := func(item map[string]any, omitResult bool) string {
+		fields := make(map[string]any, len(item))
+		for key, value := range item {
+			if key == "type" || key == "id" || key == "result" && omitResult {
+				continue
+			}
+			fields[key] = value
+		}
+		if raw, err := json.MarshalIndent(fields, "", "  "); err == nil {
+			return string(raw)
+		}
+		return _itemText(item)
+	}
+
+	_toolEvent := func(
+		name, id, content, content0 string,
+		timestamp int64,
+		failed bool,
+		images []string,
+		complete bool,
+	) []harness.Event {
+		startContent := content0
+		if startContent == "" {
+			startContent = content
+			if chars := []rune(startContent); len(chars) > 160 {
+				startContent = string(chars[:160])
+			}
+		}
+		events := []harness.Event{{
+			Type: harness.EventToolStart, ToolName: name, ToolCallID: id,
+			Content: startContent, TimestampMs: timestamp,
+		}}
+		if complete {
+			events = append(events, harness.Event{
+				Type: harness.EventToolEnd, ToolName: name, ToolCallID: id,
+				ToolFailed: failed, Content: content, Images: images, TimestampMs: timestamp,
+			})
+		}
+		return events
+	}
+
+	_convert := func(item map[string]any, timestamp int64, turnID string) []harness.Event {
 		typeName, _ := item["type"].(string)
 		content := _itemText(item)
 		switch typeName {
@@ -446,9 +506,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 					}
 				}
 			}
-			return []harness.Event{{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp}}
+			return []harness.Event{{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp, RewindID: turnID}}
 		case "agentMessage":
 			return []harness.Event{{Type: harness.EventAssistant, Content: content, TimestampMs: timestamp}}
+		case "ContextCompaction", "contextCompaction", "compacted":
+			return []harness.Event{{Type: harness.EventAssistant, Content: "Context compacted.", TimestampMs: timestamp}}
 		case "reasoning":
 			return []harness.Event{{Type: harness.EventThinking, Content: content, TimestampMs: timestamp}}
 		case "commandExecution":
@@ -459,12 +521,14 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			if fields := strings.Fields(cmd); len(fields) > 0 {
 				name = filepath.Base(fields[0])
 			}
-			start := harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, Content: cmd, TimestampMs: timestamp}
-			if status == "inProgress" {
-				return []harness.Event{start}
+			content = _itemJSON(item, false)
+			var content0 string
+			if actions, ok := item["commandActions"]; ok {
+				if raw, err := json.MarshalIndent(actions, "", "  "); err == nil {
+					content0 = string(raw)
+				}
 			}
-			output, _ := item["aggregatedOutput"].(string)
-			return []harness.Event{start, {Type: harness.EventToolEnd, ToolName: name, ToolCallID: id, ToolFailed: status == "failed", Content: output, TimestampMs: timestamp}}
+			return _toolEvent(name, id, content, content0, timestamp, status == "failed", nil, status != "inProgress")
 		case "Extension", "extension", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageGeneration":
 			id, _ := item["id"].(string)
 			name := typeName
@@ -475,23 +539,68 @@ func (a *Adapter) Poll(s *harness.Session) error {
 					name = typeName
 				}
 			}
-			if typeName == "Extension" || typeName == "extension" || typeName == "imageGeneration" {
-				fields := make(map[string]any, len(item))
-				for key, value := range item {
-					if key != "type" && key != "id" && key != "kind" && key != "status" && (key != "result" || name != "image_gen.generation" && typeName != "imageGeneration") {
-						fields[key] = value
+			if typeName == "mcpToolCall" {
+				tool, _ := item["tool"].(string)
+				if tool != "" {
+					name = tool
+					if server, _ := item["server"].(string); server != "" {
+						name = server + "/" + tool
 					}
 				}
-				if raw, err := json.MarshalIndent(fields, "", "  "); err == nil {
-					content = string(raw)
+			}
+			if typeName == "dynamicToolCall" {
+				tool, _ := item["tool"].(string)
+				if namespace, _ := item["namespace"].(string); namespace != "" {
+					tool = namespace + "." + tool
+				}
+				if tool != "" {
+					name = tool
 				}
 			}
+
+			content0 := ""
+			// special show diff for filechange
+			if typeName == "fileChange" {
+				var diffs, paths []string
+				if changes, ok := item["changes"].([]any); ok {
+					for _, value := range changes {
+						change, ok := value.(map[string]any)
+						if !ok {
+							continue
+						}
+						if diff, _ := change["diff"].(string); diff != "" {
+							diffs = append(diffs, diff)
+						}
+						path, _ := change["path"].(string)
+						kind, _ := change["kind"].(string)
+						if value, ok := change["kind"].(map[string]any); ok {
+							kind, _ = value["type"].(string)
+							if movePath, _ := value["move_path"].(string); movePath != "" {
+								kind += " -> " + movePath
+							}
+						}
+						if path != "" || kind != "" {
+							paths = append(paths, strings.TrimSpace(path+" "+kind))
+						}
+					}
+				}
+				content = strings.Join(diffs, "\n")
+				content0 = strings.Join(paths, "\n")
+			} else {
+				omitResult := typeName == "imageGeneration" ||
+					(typeName == "Extension" || typeName == "extension") && name != "image_gen.generation"
+				content = _itemJSON(item, omitResult)
+			}
+			status, _ := item["status"].(string)
+			failed := status == "failed" || status == "declined" || item["success"] == false || item["error"] != nil
+
+			// special add image for image gen
 			if name == "image_gen.generation" || typeName == "imageGeneration" {
 				if result, ok := item["result"].(string); ok && result != "" {
 					images = []string{harness.DataURI("image/png", result)}
 				}
 			}
-			return []harness.Event{{Type: harness.EventToolStart, ToolName: name, ToolCallID: id, Content: content, TimestampMs: timestamp}, {Type: harness.EventToolEnd, ToolName: name, ToolCallID: id, Content: content, Images: images, TimestampMs: timestamp}}
+			return _toolEvent(name, id, content, content0, timestamp, failed, images, true)
 		case "error":
 			return []harness.Event{{Type: harness.EventError, Content: content, TimestampMs: timestamp}}
 		}
@@ -499,12 +608,12 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 
 	// updates Codex partial events with new info
-	_upsertItem := func(item map[string]any, timestamp int64, completed bool) {
+	_upsertItem := func(item map[string]any, timestamp int64, turnID string, completed bool) {
 		id, _ := item["id"].(string)
 		if id == "" {
 			return
 		}
-		next := _convert(item, timestamp)
+		next := _convert(item, timestamp, turnID)
 		ref, exists := c.eventRefs[id]
 		if exists && ref.completed && !completed {
 			return
@@ -569,6 +678,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			ThreadID    string         `json:"threadId"`
 			Item        map[string]any `json:"item"`
 			StartedAtMs int64          `json:"startedAtMs"`
+			TurnID      string         `json:"turnId"`
 			Turn        struct {
 				ID        string           `json:"id"`
 				StartedAt int64            `json:"startedAt"`
@@ -597,7 +707,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		case "turn/completed":
 			if includeItemEvents {
 				for _, item := range params.Turn.Items {
-					_upsertItem(item, params.Turn.StartedAt*1000, true)
+					_upsertItem(item, params.Turn.StartedAt*1000, params.Turn.ID, true)
 				}
 				if afterSnapshot {
 					eventBusy, eventBusyKnown = false, true
@@ -608,7 +718,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			c.mu.Unlock()
 		case "item/started", "item/completed":
 			if includeItemEvents && (method == "item/completed" || params.Item["type"] != "agentMessage") {
-				_upsertItem(params.Item, params.StartedAtMs, method == "item/completed")
+				_upsertItem(params.Item, params.StartedAtMs, params.TurnID, method == "item/completed")
 			}
 		case "item/agentMessage/delta":
 			// Keep partial assistant text out of Session.Events; item/completed carries the full message.
@@ -670,8 +780,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	c.mu.Unlock()
 	var result struct {
 		Thread struct {
-			Name      string `json:"name"`
-			UpdatedAt int64  `json:"updatedAt"`
+			UpdatedAt int64 `json:"updatedAt"`
 			Status    struct {
 				Type string `json:"type"`
 			} `json:"status"`
@@ -683,6 +792,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 
 	if full {
 		var turns []struct {
+			ID        string           `json:"id"`
 			StartedAt int64            `json:"startedAt"`
 			Items     []map[string]any `json:"items"`
 		}
@@ -694,6 +804,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			}
 			pageRaw, _, err := processRPC.call("thread/turns/list", params)
 			if err != nil {
+				// here we allow some errs to be skipped
 				if strings.Contains(err.Error(), "list_turns is not supported yet") || cursor == "" && strings.Contains(err.Error(), "thread/turns/list is unavailable before first user message") {
 					break
 				}
@@ -701,6 +812,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			}
 			var page struct {
 				Data []struct {
+					ID        string           `json:"id"`
 					StartedAt int64            `json:"startedAt"`
 					Items     []map[string]any `json:"items"`
 				} `json:"data"`
@@ -730,7 +842,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				}
 				id, _ := item["id"].(string)
 				timestamp := turn.StartedAt * 1000
-				converted := _convert(item, timestamp)
+				converted := _convert(item, timestamp, turn.ID)
 				indices := make([]int, 0, len(converted))
 				for _, event := range converted {
 					indices = append(indices, len(events))
@@ -796,7 +908,6 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.Events = append(s.Events, pendingErrors...)
 	s.BusyCli = busy
 	s.DoFullHistory = false
-	s.Name = result.Thread.Name
 	s.LastTimestampMs = result.Thread.UpdatedAt * 1000
 	s.FullInputToken, s.FullOutputToken = usage.Total.InputTokens, usage.Total.OutputTokens
 	s.CacheReadToken, s.CacheWriteToken = usage.Total.CachedInputTokens, usage.Total.CacheWriteInputTokens

@@ -2,6 +2,7 @@ package pi
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +26,32 @@ type connStruct struct {
 	Cursor  string
 }
 
+type piEntry struct {
+	ID        string  `json:"id"`
+	ParentID  *string `json:"parentId"`
+	Type      string  `json:"type"`
+	Timestamp string  `json:"timestamp"`
+	Message   struct {
+		Role         string          `json:"role"`
+		ErrorMessage string          `json:"errorMessage"`
+		Content      json.RawMessage `json:"content"`
+		Model        string          `json:"model"`
+		ToolCallID   string          `json:"toolCallId"`
+		ToolName     string          `json:"toolName"`
+		IsError      bool            `json:"isError"`
+	} `json:"message"`
+}
+
+//go:embed ahweb-pi-extension.js
+var rewindExtension []byte
+
+const extensionPath = "/tmp/ahweb-pi-extension.js"
+
 var (
-	cacheMu    sync.Mutex
-	cacheConns = make(map[string]map[string]*connStruct)
+	cacheMu        sync.Mutex
+	cacheConns     = make(map[string]map[string]*connStruct)
+	extensionMu    sync.Mutex
+	extensionReady bool
 )
 
 // === adapter admin fns
@@ -156,12 +180,10 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 				}
 				_ = parent.Close()
 			}
-			var firstMessage string
 			gotFirstMessage := false
 			for scanner.Scan() {
 				var entry struct {
 					Type      string `json:"type"`
-					Name      string `json:"name"`
 					Timestamp string `json:"timestamp"`
 					Message   struct {
 						Role    string          `json:"role"`
@@ -171,20 +193,14 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 				if json.Unmarshal(scanner.Bytes(), &entry) != nil {
 					continue
 				}
-				if entry.Type == "session_info" {
-					s.Name = entry.Name
-				}
 				if entry.Type == "message" && entry.Message.Role == "user" && !gotFirstMessage {
 					gotFirstMessage = true
-					if json.Unmarshal(entry.Message.Content, &firstMessage) != nil {
-						var parts []struct {
-							Type string `json:"type"`
-							Text string `json:"text"`
-						}
+					if json.Unmarshal(entry.Message.Content, &s.FirstUserMsg) != nil {
+						var parts []struct{ Type, Text string }
 						if json.Unmarshal(entry.Message.Content, &parts) == nil {
 							for _, part := range parts {
 								if part.Type == "text" {
-									firstMessage += part.Text
+									s.FirstUserMsg += part.Text
 								}
 							}
 						}
@@ -194,7 +210,6 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 					s.LastTimestampMs = timestamp.UnixMilli()
 				}
 			}
-			s.FirstUserMsg = firstMessage
 			sessions = append(sessions, s)
 		}
 		_ = file.Close()
@@ -261,7 +276,16 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 		cacheConns[folder][s.ID] = conn
 		cacheMu.Unlock()
 	}
-	cmd := exec.Command("pi", "--mode", "rpc", "--session-id", s.ID)
+	extensionMu.Lock()
+	if !extensionReady {
+		if err := os.WriteFile(extensionPath, rewindExtension, 0600); err != nil {
+			extensionMu.Unlock()
+			return fmt.Errorf("could not write Pi extension: %w", err)
+		}
+		extensionReady = true
+	}
+	extensionMu.Unlock()
+	cmd := exec.Command("pi", "--mode", "rpc", "--session-id", s.ID, "--extension", extensionPath)
 	cmd.Dir = folder
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -283,6 +307,60 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 	s.Mu.Lock()
 	s.DoFullHistory = true
 	defer s.Mu.Unlock()
+	return nil
+}
+
+func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
+	conn, err := a.conn(s)
+	if err != nil {
+		return err
+	}
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	if conn.Cmd == nil || conn.Cmd.ProcessState != nil {
+		return errors.New("Pi session is not running")
+	}
+	type entriesResponse struct {
+		Entries []piEntry `json:"entries"`
+		LeafID  *string   `json:"leafId"`
+	}
+
+	// find the rewind target
+	id := fmt.Sprintf("rewind-%d", time.Now().UnixNano())
+	var entries struct {
+		Data entriesResponse `json:"data"`
+	}
+	if err := rpcRequest(conn, id, map[string]any{"type": "get_entries"}, &entries); err != nil {
+		return err
+	}
+	var target *piEntry
+	for i := range entries.Data.Entries {
+		if entries.Data.Entries[i].ID == rewindID && entries.Data.Entries[i].Type == "message" && entries.Data.Entries[i].Message.Role == "user" {
+			target = &entries.Data.Entries[i]
+			break
+		}
+	}
+	if target == nil {
+		return errors.New("Pi rewind target was not found")
+	}
+
+	// use the cmd in custom extension then check that we return a valid path
+	if err := rpcRequest(conn, id+"-command", map[string]any{"type": "prompt", "message": "/ahweb-rewind " + rewindID}, nil); err != nil {
+		return err
+	}
+	var result struct {
+		Data entriesResponse `json:"data"`
+	}
+	if err := rpcRequest(conn, id+"-verify", map[string]any{"type": "get_entries"}, &result); err != nil {
+		return err
+	}
+	if target.ParentID == nil {
+		if result.Data.LeafID != nil {
+			return errors.New("Pi rewind did not return to the session root")
+		}
+	} else if result.Data.LeafID == nil || *result.Data.LeafID != *target.ParentID {
+		return errors.New("Pi rewind did not reach the requested message")
+	}
 	return nil
 }
 
@@ -373,37 +451,15 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		return errors.New("Pi session is not running")
 	}
 
-	request := func(command map[string]any) error {
-		id := fmt.Sprintf("prompt-%d", time.Now().UnixNano())
-		command["id"] = id
-		if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
-			return fmt.Errorf("could not send Pi command: %w", err)
-		}
-		var response struct {
-			Type    string `json:"type"`
-			ID      string `json:"id"`
-			Success bool   `json:"success"`
-			Error   string `json:"error"`
-		}
-		for {
-			if err := conn.Decoder.Decode(&response); err != nil {
-				return fmt.Errorf("could not read Pi response: %w", err)
-			}
-			if response.Type != "response" || response.ID != id {
-				continue
-			}
-			if !response.Success {
-				return fmt.Errorf("Pi refused command: %s", response.Error)
-			}
-			return nil
-		}
+	send := func(command map[string]any) error {
+		return rpcRequest(conn, fmt.Sprintf("prompt-%d", time.Now().UnixNano()), command, nil)
 	}
 	if model != nil {
 		provider, modelID, ok := strings.Cut(model.ID, "/")
 		if !ok || provider == "" || modelID == "" {
 			return fmt.Errorf("invalid Pi model ID: %q", model.ID)
 		}
-		if err := request(map[string]any{"type": "set_model", "provider": provider, "modelId": modelID}); err != nil {
+		if err := send(map[string]any{"type": "set_model", "provider": provider, "modelId": modelID}); err != nil {
 			return err
 		}
 		if reasoning == "" {
@@ -412,7 +468,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			}
 		}
 		if reasoning != "" {
-			if err := request(map[string]any{"type": "set_thinking_level", "level": reasoning}); err != nil {
+			if err := send(map[string]any{"type": "set_thinking_level", "level": reasoning}); err != nil {
 				return err
 			}
 		}
@@ -429,7 +485,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		}
 		command["images"] = parts
 	}
-	if err := request(command); err != nil {
+	if err := send(command); err != nil {
 		return err
 	}
 	// Mark the session busy so the web UI will poll.
@@ -451,27 +507,7 @@ func (a *Adapter) Stop(s *harness.Session) error {
 		return nil
 	}
 	id := fmt.Sprintf("stop-%d", time.Now().UnixNano())
-	if err := json.NewEncoder(conn.Stdin).Encode(map[string]string{"id": id, "type": "abort"}); err != nil {
-		return fmt.Errorf("could not request Pi stop: %w", err)
-	}
-	var response struct {
-		Type    string `json:"type"`
-		ID      string `json:"id"`
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-	}
-	for {
-		if err := conn.Decoder.Decode(&response); err != nil {
-			return fmt.Errorf("could not read Pi stop response: %w", err)
-		}
-		if response.Type != "response" || response.ID != id {
-			continue
-		}
-		if !response.Success {
-			return fmt.Errorf("Pi refused stop: %s", response.Error)
-		}
-		return nil
-	}
+	return rpcRequest(conn, id, map[string]any{"type": "abort"}, nil)
 }
 
 func (a *Adapter) Poll(s *harness.Session) error {
@@ -489,62 +525,68 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	full := s.DoFullHistory
 	s.Mu.Unlock()
 
-	id := fmt.Sprintf("poll-%d", time.Now().UnixNano())
-	command := map[string]any{"id": id, "type": "get_entries"}
-	if !full && conn.Cursor != "" {
-		command["since"] = conn.Cursor
-	}
-	if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
-		return fmt.Errorf("could not request Pi entries: %w", err)
-	}
-
-	// utils
 	var response struct {
 		Type    string `json:"type"`
 		ID      string `json:"id"`
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 		Data    struct {
-			Entries []struct {
-				ID        string `json:"id"`
-				Type      string `json:"type"`
-				Timestamp string `json:"timestamp"`
-				Name      string `json:"name"`
-				Message   struct {
-					Role         string          `json:"role"`
-					ErrorMessage string          `json:"errorMessage"`
-					Content      json.RawMessage `json:"content"`
-					Model        string          `json:"model"`
-					ToolCallID   string          `json:"toolCallId"`
-					ToolName     string          `json:"toolName"`
-					IsError      bool            `json:"isError"`
-				} `json:"message"`
-			} `json:"entries"`
-			LeafID *string `json:"leafId"`
+			Entries []piEntry `json:"entries"`
+			LeafID  *string   `json:"leafId"`
 		} `json:"data"`
 	}
-	for {
-		if err := conn.Decoder.Decode(&response); err != nil {
-			return fmt.Errorf("could not read Pi entries: %w", err)
+	_requestEntries := func(requestID, since string) error {
+		command := map[string]any{"id": requestID, "type": "get_entries"}
+		if since != "" {
+			command["since"] = since
 		}
-		if response.Type != "response" || response.ID != id {
-			continue
+		if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
+			return fmt.Errorf("could not request Pi entries: %w", err)
 		}
-		if !response.Success {
-			return fmt.Errorf("Pi refused entries: %s", response.Error)
+		for {
+			if err := conn.Decoder.Decode(&response); err != nil {
+				return fmt.Errorf("could not read Pi entries: %w", err)
+			}
+			if response.Type != "response" || response.ID != requestID {
+				continue
+			}
+			if !response.Success {
+				return fmt.Errorf("Pi refused entries: %s", response.Error)
+			}
+			return nil
 		}
-		break
 	}
 
-	// acutally poll entries
-	events := make([]harness.Event, 0)
-	for _, entry := range response.Data.Entries {
-		conn.Cursor = entry.ID
-		if entry.Type == "session_info" && entry.Name != "" {
-			s.Mu.Lock()
-			s.Name = entry.Name
-			s.Mu.Unlock()
+	// getting ready to poll session  + get active branch
+	id := fmt.Sprintf("poll-%d", time.Now().UnixNano())
+	since := ""
+	if !full {
+		since = conn.Cursor
+	}
+	if err := _requestEntries(id, since); err != nil {
+		return err
+	}
+	leafID := ""
+	if response.Data.LeafID != nil {
+		leafID = *response.Data.LeafID
+	}
+	path := activePath(response.Data.Entries, leafID)
+	if !full && conn.Cursor != "" && leafID != conn.Cursor && (len(path) == 0 || path[0].ParentID == nil || *path[0].ParentID != conn.Cursor) {
+		if err := _requestEntries(id+"-full", ""); err != nil {
+			return err
 		}
+		leafID = ""
+		if response.Data.LeafID != nil {
+			leafID = *response.Data.LeafID
+		}
+		path = activePath(response.Data.Entries, leafID)
+		full = true
+	}
+
+	// process and form the events
+	events := make([]harness.Event, 0)
+	for _, entry := range path {
+		conn.Cursor = entry.ID
 		if entry.Type != "message" {
 			continue
 		}
@@ -605,7 +647,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			events = append(events, harness.Event{Type: harness.EventToolEnd, ToolName: entry.Message.ToolName, ToolCallID: entry.Message.ToolCallID, Content: strings.TrimSpace(result), Images: images, ToolFailed: entry.Message.IsError, TimestampMs: timestamp})
 		case "user":
 			if content = strings.TrimSpace(content); content != "" || len(images) > 0 {
-				events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp})
+				events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp, RewindID: entry.ID})
 			}
 		case "assistant":
 			if entry.Message.ErrorMessage != "" {
@@ -687,12 +729,13 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.BusyCli = busyCli
 	if full {
 		s.Events = events
+		s.FirstUserMsg = ""
 	} else {
 		s.Events = append(s.Events, events...)
 	}
-	if s.FirstUserMsg == "" {
+	if full || s.FirstUserMsg == "" {
 		for _, event := range events {
-			if event.Type == harness.EventUser && event.Content != "" {
+			if event.Type == harness.EventUser {
 				s.FirstUserMsg = event.Content
 				break
 			}
@@ -708,11 +751,17 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		s.ContextTokens = *statsResponse.Data.ContextUsage.Tokens
 	}
 	s.ContextWindow = statsResponse.Data.ContextUsage.ContextWindow
-	for _, entry := range response.Data.Entries {
-		if entry.Type == "message" {
-			if timestamp, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil && timestamp.UnixMilli() > s.LastTimestampMs {
-				s.LastTimestampMs = timestamp.UnixMilli()
-			}
+	if full {
+		s.LastTimestampMs = 0
+	}
+
+	// populate latest timestamp
+	for _, entry := range path {
+		if entry.Type != "message" {
+			continue
+		}
+		if timestamp, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil && timestamp.UnixMilli() > s.LastTimestampMs {
+			s.LastTimestampMs = timestamp.UnixMilli()
 		}
 	}
 	s.Mu.Unlock()
@@ -720,6 +769,66 @@ func (a *Adapter) Poll(s *harness.Session) error {
 }
 
 // === utils fns
+
+func rpcRequest(conn *connStruct, id string, command map[string]any, result any) error {
+	command["id"] = id
+	if err := json.NewEncoder(conn.Stdin).Encode(command); err != nil {
+		return fmt.Errorf("could not send Pi command: %w", err)
+	}
+	for {
+		var raw json.RawMessage
+		if err := conn.Decoder.Decode(&raw); err != nil {
+			return fmt.Errorf("could not read Pi response: %w", err)
+		}
+		var response struct {
+			Type    string `json:"type"`
+			ID      string `json:"id"`
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &response); err != nil {
+			return fmt.Errorf("could not decode Pi response: %w", err)
+		}
+		if response.Type != "response" || response.ID != id {
+			continue
+		}
+		if !response.Success {
+			return fmt.Errorf("Pi refused command: %s", response.Error)
+		}
+		if result != nil {
+			if err := json.Unmarshal(raw, result); err != nil {
+				return fmt.Errorf("could not decode Pi response data: %w", err)
+			}
+		}
+		return nil
+	}
+
+}
+
+func activePath(entries []piEntry, leafID string) []piEntry {
+	byID := make(map[string]piEntry, len(entries))
+	for _, entry := range entries {
+		byID[entry.ID] = entry
+	}
+	path := make([]piEntry, 0)
+	seen := make(map[string]bool)
+	for id := leafID; id != "" && !seen[id]; {
+		entry, ok := byID[id]
+		if !ok {
+			break
+		}
+		seen[id] = true
+		path = append(path, entry)
+		if entry.ParentID == nil {
+			break
+		}
+		id = *entry.ParentID
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path
+}
 
 func (*Adapter) conn(s *harness.Session) (*connStruct, error) {
 	cacheMu.Lock()

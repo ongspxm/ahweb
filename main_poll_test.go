@@ -47,6 +47,10 @@ func (a *startupAdapter) Connect(*harness.Session, bool) error {
 	return nil
 }
 func (a *startupAdapter) Poll(*harness.Session) error { a.calls = append(a.calls, "poll"); return nil }
+func (a *startupAdapter) Rewind(*harness.Session, string) error {
+	a.calls = append(a.calls, "rewind")
+	return nil
+}
 func (a *startupAdapter) CleanUp(*harness.Session) error {
 	a.calls = append(a.calls, "cleanup")
 	return nil
@@ -57,6 +61,23 @@ func (a *startupAdapter) SendPrompt(*harness.Session) error {
 		return errors.New("send failed")
 	}
 	return nil
+}
+
+func TestRewindConnectsBeforeRewind(t *testing.T) {
+	s := &harness.Session{SessionLite: harness.SessionLite{ID: "sess", Harness: "test"}}
+	adapter := &startupAdapter{}
+	a := &app{adapters: map[string]harness.Adapter{"test": adapter}}
+	done := &sync.WaitGroup{}
+	done.Add(1)
+	result := make(chan error, 1)
+	a.pollSession(pollJob{session: s, done: done, rewindResult: result, rewindID: "entry"})
+	done.Wait()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(adapter.calls, ","); got != "connect,rewind,connect,poll" {
+		t.Fatalf("calls = %s, want connect,rewind,connect,poll", got)
+	}
 }
 
 func TestFirstPromptBeforePoll(t *testing.T) {

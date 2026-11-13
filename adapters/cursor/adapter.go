@@ -306,6 +306,17 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 				c.events = append(c.events, event)
 				c.mu.Unlock()
 			}
+			_toolArgs := func(args map[string]any) string {
+				for _, key := range []string{"command", "pattern", "path", "glob_pattern", "globPattern", "search_term", "description", "prompt"} {
+					if v, _ := args[key].(string); strings.TrimSpace(v) != "" {
+						return strings.TrimSpace(v)
+					}
+				}
+				if raw, err := json.Marshal(args); err == nil {
+					return string(raw)
+				}
+				return ""
+			}
 			switch kind {
 			case "system":
 				if subtype, _ := msg["subtype"].(string); subtype == "init" {
@@ -358,6 +369,9 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 				event.ToolName = name
 				if subtype == "started" {
 					event.Type = harness.EventToolStart
+					if args, _ := call["args"].(map[string]any); args != nil {
+						event.Content = _toolArgs(args)
+					}
 					_add(event)
 					continue
 				}
@@ -423,9 +437,6 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		}
 		c.cmd = nil
 		c.mu.Unlock()
-		s.Mu.Lock()
-		s.BusyCli = false
-		s.Mu.Unlock()
 		close(done)
 	}()
 	return nil
@@ -508,12 +519,16 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.Events, s.BusyCli, s.DoFullHistory = events, busy, false
 	s.FullInputToken, s.FullOutputToken = inputTokens, outputTokens
 	s.CacheReadToken, s.CacheWriteToken, s.FullCost = cacheRead, cacheWrite, cost
+	if fullHistory {
+		s.FirstUserMsg = ""
+	}
+	firstUserFound := s.FirstUserMsg != ""
 	for _, event := range events {
 		if event.TimestampMs > s.LastTimestampMs {
 			s.LastTimestampMs = event.TimestampMs
 		}
-		if event.Type == harness.EventUser && s.FirstUserMsg == "" {
-			s.FirstUserMsg = event.Content
+		if event.Type == harness.EventUser && !firstUserFound {
+			s.FirstUserMsg, firstUserFound = event.Content, true
 		}
 	}
 	s.Mu.Unlock()

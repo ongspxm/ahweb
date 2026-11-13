@@ -47,6 +47,7 @@ type apiUsage struct {
 }
 
 type apiMessage struct {
+	ID   string `json:"id"`
 	Type string `json:"type"`
 	Text string `json:"text"`
 	Time struct {
@@ -136,7 +137,7 @@ func (m apiMessage) events() []harness.Event {
 		if content == "" && len(images) == 0 {
 			return nil
 		}
-		return []harness.Event{{Type: harness.EventUser, Content: content, Images: images, TimestampMs: ts}}
+		return []harness.Event{{Type: harness.EventUser, Content: content, Images: images, TimestampMs: ts, RewindID: m.ID}}
 	}
 	if m.Type != "assistant" {
 		return nil
@@ -355,6 +356,7 @@ func processSSECache(id OpencodeID, discardIncomplete bool) ([]apiMessage, []api
 			}
 		}
 		message := map[string]any{
+			"id":     mid,
 			"type":   info.Role,
 			"time":   info.Time,
 			"model":  map[string]string{"id": info.ModelID, "providerID": info.ProviderID},

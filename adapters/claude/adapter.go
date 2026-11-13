@@ -618,7 +618,8 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		}
 	}
 	s.BusyCli = busy
-	if len(s.Events) > 0 && s.FirstUserMsg == "" {
+	if fullHistory || s.FirstUserMsg == "" {
+		s.FirstUserMsg = ""
 		for _, e := range s.Events {
 			if e.Type == harness.EventUser {
 				s.FirstUserMsg = e.Content

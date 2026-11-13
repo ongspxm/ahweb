@@ -209,7 +209,6 @@ func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error)
 			Data []struct {
 				ParentID string `json:"parentID"`
 				ID       string `json:"id"`
-				Title    string `json:"title"`
 				Time     struct {
 					Updated int64 `json:"updated"`
 				} `json:"time"`
@@ -225,6 +224,34 @@ func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error)
 			break
 		}
 		for _, item := range page.Data {
+			firstUserMsg, firstUserFound := "", false
+			q := url.Values{"limit": {"200"}, "order": {"asc"}}
+			for {
+				var history struct {
+					Data   []apiMessage `json:"data"`
+					Cursor struct {
+						Next *string `json:"next"`
+					} `json:"cursor"`
+				}
+				if err := (&Conn{OpencodeID: item.ID}).call(http.MethodGet, "/message", q, nil, &history); err != nil {
+					return nil, err
+				}
+				for _, message := range history.Data {
+					for _, event := range message.events() {
+						if event.Type == harness.EventUser {
+							firstUserMsg, firstUserFound = event.Content, true
+							break
+						}
+					}
+					if firstUserFound {
+						break
+					}
+				}
+				if firstUserFound || history.Cursor.Next == nil {
+					break
+				}
+				q.Set("cursor", *history.Cursor.Next)
+			}
 			id := item.ID
 			cacheMu.Lock()
 			if local := toLocalIDs[id]; local != "" {
@@ -237,8 +264,7 @@ func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error)
 				parentID = local
 			}
 			cacheMu.Unlock()
-			s := harness.SessionLite{ID: id, RealPath: realFolder, Harness: "opencode", Name: item.Title, LastTimestampMs: item.Time.Updated, ParentSessID: parentID}
-			result = append(result, s)
+			result = append(result, harness.SessionLite{ID: id, RealPath: realFolder, Harness: "opencode", FirstUserMsg: firstUserMsg, LastTimestampMs: item.Time.Updated, ParentSessID: parentID})
 		}
 		if page.Cursor.Next == nil {
 			break
@@ -401,6 +427,21 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	return nil
 }
 
+func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
+	conn, err := a.conn(s)
+	if err != nil {
+		return err
+	}
+	if err := conn.call(http.MethodPost, "/revert/stage", nil, map[string]string{"messageID": rewindID}, nil); err != nil {
+		return err
+	}
+	if err := conn.call(http.MethodPost, "/revert/commit", nil, nil, nil); err != nil {
+		_ = conn.call(http.MethodDelete, "/revert", nil, nil, nil)
+		return err
+	}
+	return nil
+}
+
 func (a *Adapter) Stop(s *harness.Session) error {
 	conn, err := a.conn(s)
 	if err != nil {
@@ -415,12 +456,9 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	var lastMessage, lastAssistant apiMessage
 	var processedFullMessages, hasAssistant bool
 
-	_updateStats := func(title string, updated int64) {
+	_updateStats := func(updated int64) {
 		s.Mu.Lock()
 		defer s.Mu.Unlock()
-		if title != "" {
-			s.Name = title
-		}
 		s.LastTimestampMs = updated
 		if !processedFullMessages {
 			return
@@ -445,8 +483,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 	var info struct {
 		Data struct {
-			Title string `json:"title"`
-			Time  struct {
+			Time struct {
 				Updated int64 `json:"updated"`
 			} `json:"time"`
 		} `json:"data"`
@@ -455,14 +492,8 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		return err
 	}
 	update := info.Data.Time.Updated
-	title := info.Data.Title
-	if title == conn.OpencodeID {
-		title = ""
-	}
-
 	s.Mu.Lock()
 	full, busy := s.DoFullHistory, s.BusyCli
-	s.Name = title
 	s.LastTimestampMs = update
 	s.Mu.Unlock()
 
@@ -503,7 +534,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			if pending || busy {
 				return nil
 			}
-			_updateStats(title, update)
+			_updateStats(update)
 			return nil
 		}
 	}
@@ -520,6 +551,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	sseCacheMu.Unlock()
 	sessionCacheMu.Unlock()
 	var first string
+	firstUserFound := false
 	for {
 		q := url.Values{"limit": {"200"}}
 		if cursor == "" {
@@ -559,20 +591,18 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		}
 		for _, event := range message.events() {
 			events = append(events, event)
-			if first == "" && event.Type == harness.EventUser {
-				first = event.Content
+			if !firstUserFound && event.Type == harness.EventUser {
+				first, firstUserFound = event.Content, true
 			}
 		}
 	}
 	s.Mu.Lock()
 	s.Events = events
-	if s.FirstUserMsg == "" {
-		s.FirstUserMsg = first
-	}
+	s.FirstUserMsg = first
 	s.DoFullHistory = false
 	s.Mu.Unlock()
 	conn.Fetched, conn.LastUpdated = true, update
-	_updateStats(title, update)
+	_updateStats(update)
 	return nil
 }
 

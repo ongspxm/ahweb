@@ -186,6 +186,7 @@ func main() {
 	mux.HandleFunc("/api/events", server.handleEvents)
 	mux.HandleFunc("/api/stop", server.handleStop)
 	mux.HandleFunc("/api/unqueue", server.handleUnqueue)
+	mux.HandleFunc("/api/rewind", server.handleRewind)
 	mux.HandleFunc("/api/prompt", server.handlePrompt)
 	mux.HandleFunc("/api/cli", server.handleCLI)
 	address := fmt.Sprintf("0.0.0.0:%d", *port)

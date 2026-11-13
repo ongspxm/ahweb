@@ -16,10 +16,16 @@ type pollJob struct {
 	session *harness.Session
 	done    *sync.WaitGroup
 
-	// deleteResult!=nil means this is a poll req to delete
-	// deleteLast is preview tstamp for us to match session tstamp
+	// xxxResult != nil means that the poll job is for delete/rewind
+	// done is for completion, xxxResult is for err + job identification
+
+	// deleteLast is tstamp of preview for us to match preview tstamp and sess tstamp
 	deleteResult chan error
 	deleteLast   int64
+
+	// rewindID is the id of the msg we want to rewind up till
+	rewindResult chan error
+	rewindID     string
 }
 
 func (a *app) pollLoop() {
@@ -51,7 +57,7 @@ func (a *app) pollSession(job pollJob) {
 			err = errors.New("session is already being deleted")
 		} else if s.IsStopping {
 			err = errors.New("session is stopping")
-		} else if s.BusyMsg || s.BusyCli || s.QueuedMsg != "" {
+		} else if s.GetIsBusyLocked() {
 			err = errors.New("cannot delete a busy session")
 		} else if s.LastTimestampMs != job.deleteLast {
 			err = errors.New("session changed since preview")
@@ -76,11 +82,36 @@ func (a *app) pollSession(job pollJob) {
 		job.deleteResult <- err
 		return
 	}
-	s.Mu.Lock()
-	retired := s.IsDeleted
-	s.Mu.Unlock()
-	if retired {
-		return
+
+	// perform rewind (follow up with full history poll in same poll run)
+	if job.rewindResult != nil {
+		s.Mu.Lock()
+		if !s.GetCanRewindLocked() {
+			s.IsRewinding = false
+			s.Mu.Unlock()
+			job.rewindResult <- errors.New("cannot rewind a busy / deleted session")
+			return
+		}
+		s.Mu.Unlock()
+		adp := a.adapters[s.Harness]
+		var err error
+		if adp == nil {
+			err = errors.New("session adapter is unavailable")
+		} else if err = adp.Connect(s, false); err == nil {
+			err = adp.Rewind(s, job.rewindID)
+		}
+
+		if err != nil {
+			s.Mu.Lock()
+			s.IsRewinding = false
+			s.Mu.Unlock()
+			job.rewindResult <- err
+			return
+		}
+		s.Mu.Lock()
+		s.DoFullHistory = true
+		s.EmptyPollCnt = 0
+		s.Mu.Unlock()
 	}
 
 	// do poll if still active
@@ -93,13 +124,20 @@ func (a *app) pollSession(job pollJob) {
 	s.DoFullHistory = doFullHistory
 	s.Mu.Unlock()
 
+	// connect to make sure session is alive
 	adp := a.adapters[s.Harness]
 	if err := adp.Connect(s, !s.GetIsBusy() && doFullHistory); err != nil {
 		log.Printf("adapter.connect(%s, %s) failed: %v", s.Harness, s.ID, err)
 		s.Mu.Lock()
 		s.Events = append(s.Events, harness.Event{Type: harness.EventError, Content: err.Error(), TimestampMs: time.Now().UnixMilli()})
+		if job.rewindResult != nil {
+			s.IsRewinding = false
+		}
 		s.Mu.Unlock()
 		_ = adp.CleanUp(s)
+		if job.rewindResult != nil {
+			job.rewindResult <- err
+		}
 		return
 	}
 
@@ -120,14 +158,16 @@ func (a *app) pollSession(job pollJob) {
 			return
 		}
 	}
-	if err := adp.Poll(s); err != nil {
-		log.Printf("adapter.poll(%s, %s) failed: %v", s.Harness, s.ID, err)
+	pollErr := adp.Poll(s)
+	if pollErr != nil {
+		log.Printf("adapter.poll(%s, %s) failed: %v", s.Harness, s.ID, pollErr)
 		s.Mu.Lock()
-		s.Events = append(s.Events, harness.Event{Type: harness.EventError, Content: err.Error(), TimestampMs: time.Now().UnixMilli()})
+		s.Events = append(s.Events, harness.Event{Type: harness.EventError, Content: pollErr.Error(), TimestampMs: time.Now().UnixMilli()})
 		s.Mu.Unlock()
 		_ = adp.CleanUp(s)
 	}
 
+	// clean up all the sess status flag
 	s.Mu.Lock()
 	if len(s.Events) == prevCnt {
 		s.EmptyPollCnt++
@@ -143,8 +183,8 @@ func (a *app) pollSession(job pollJob) {
 		}
 	}
 	s.BusyMsg = func() bool {
-		// Empty sessions must stay idle so their first prompt can be sent.
 		if len(s.Events) == 0 {
+			// Empty sessions must stay idle so their first prompt can be sent.
 			return false
 		}
 		if s.LastTimestampMs == 0 {
@@ -161,8 +201,15 @@ func (a *app) pollSession(job pollJob) {
 		}
 		return true
 	}()
+	if job.rewindResult != nil {
+		s.IsRewinding = false
+		s.BusyMsg = false
+	}
 	busy, queued := s.BusyMsg || s.BusyCli, s.QueuedMsg != ""
 	s.Mu.Unlock()
+	if job.rewindResult != nil {
+		job.rewindResult <- pollErr
+	}
 	if queued && !busy {
 		a.sendQueued(s, adp)
 	}

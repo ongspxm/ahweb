@@ -159,12 +159,38 @@ func (a listedSessionsAdapter) ListSessions(string) ([]harness.SessionLite, erro
 func (listedSessionsAdapter) Connect(*harness.Session, bool) error { return nil }
 func (listedSessionsAdapter) Poll(*harness.Session) error          { return nil }
 
+func TestSessionListUsesFirstUserMsgAsTitle(t *testing.T) {
+	folder := t.TempDir()
+	s := &harness.Session{SessionLite: harness.SessionLite{ID: "session", Harness: "pi", RealPath: folder, FirstUserMsg: "  first prompt  "}}
+	a := &app{sessions: map[string]map[sessionKey]*harness.Session{folder: {{harness: "pi", id: s.ID}: s}}}
+	r := testRequest(a.handleList, http.MethodGet, "/api/list?folder="+url.QueryEscape(folder), "")
+	if r.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", r.Code, r.Body)
+	}
+	var result struct {
+		Sessions []struct {
+			Name string `json:"name"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Sessions) != 1 || result.Sessions[0].Name != "first prompt" {
+		t.Fatalf("session title = %+v, want first prompt", result.Sessions)
+	}
+	if got := sessionName(harness.SessionLite{FirstUserMsg: strings.Repeat("x", 141)}); len([]rune(got)) != 140 {
+		t.Fatalf("title length = %d, want 140", len([]rune(got)))
+	}
+	if got := sessionName(harness.SessionLite{}); got != "" {
+		t.Fatalf("empty title = %q, want empty", got)
+	}
+}
 func TestSessionListingKeepsSameIDSeparateAcrossHarnesses(t *testing.T) {
 	folder := t.TempDir()
 	id := "shared-id"
 	a := &app{sessions: make(map[string]map[sessionKey]*harness.Session), adapters: map[string]harness.Adapter{
-		"pi":    listedSessionsAdapter{listed: []harness.SessionLite{{ID: id, Harness: "pi", RealPath: folder, Name: "Pi"}}},
-		"prime": listedSessionsAdapter{listed: []harness.SessionLite{{ID: id, Harness: "prime", RealPath: folder, Name: "Prime"}}},
+		"pi":    listedSessionsAdapter{listed: []harness.SessionLite{{ID: id, Harness: "pi", RealPath: folder}}},
+		"prime": listedSessionsAdapter{listed: []harness.SessionLite{{ID: id, Harness: "prime", RealPath: folder}}},
 	}}
 	a.listFolderSessions(folder)
 	if got := len(a.sessions[folder]); got != 2 {
@@ -181,7 +207,7 @@ func TestSessionListingKeepsSameIDSeparateAcrossHarnesses(t *testing.T) {
 func TestPollingAndSessionRefreshPreserveSessionIdentity(t *testing.T) {
 	folder := t.TempDir()
 	s := &harness.Session{SessionLite: harness.SessionLite{ID: "shared-id", Harness: "pi", RealPath: folder}}
-	adp := listedSessionsAdapter{listed: []harness.SessionLite{{ID: s.ID, Harness: s.Harness, RealPath: folder, Name: "updated"}}}
+	adp := listedSessionsAdapter{listed: []harness.SessionLite{{ID: s.ID, Harness: s.Harness, RealPath: folder}}}
 	a := &app{sessions: map[string]map[sessionKey]*harness.Session{
 		folder: {{harness: s.Harness, id: s.ID}: s},
 	}, adapters: map[string]harness.Adapter{"pi": adp}}
@@ -221,7 +247,7 @@ func (a modelsAdapter) GetModels() (map[string]harness.Model, error) {
 	return a.models, a.err
 }
 
-func TestModelsHandlerRefreshesHealthyAdaptersAndPreservesFailedAdapterCache(t *testing.T) {
+func TestModelsHandlerRefreshesHealthyAdaptersAndRemovesFailedAdapterCache(t *testing.T) {
 	fresh := map[string]harness.Model{"new/model": {Harness: "good", ID: "new/model", Reasoning: []string{"high"}}}
 	stale := map[string]harness.Model{"old/model": {Harness: "bad", ID: "old/model"}}
 	unrelated := map[string]harness.Model{"keep/model": {Harness: "other", ID: "keep/model"}}
