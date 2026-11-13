@@ -136,6 +136,12 @@
     #cli-keys button { margin: 0; }
     #cli-keys > div { display: contents; }
     #cli-keys button:not([data-font-size]) { display: none; }
+    #file-upload { display: flex; flex: 0 0 auto; align-items: center; gap: .4rem; padding: .5rem; border-bottom: 1px solid var(--pico-muted-border-color); }
+    #file-upload input { min-width: 0; margin: 0; }
+    #file-upload-file { flex: 1 1 auto; }
+    #file-upload-path { flex: 1 1 10rem; }
+    #file-upload button { flex: 0 0 auto; width: auto; margin: 0; padding: .5rem .75rem; }
+    #file-upload-status { flex: 0 0 auto; color: var(--pico-muted-color); font-size: .8rem; }
     #file-list, #file-view { flex: 1; min-height: 0; overflow: auto; }
     #file-list { padding: 0; border-bottom: 1px solid var(--pico-muted-border-color); color: var(--pico-color); }
     #file-list .file-list-empty { padding: .9rem; }
@@ -306,6 +312,12 @@
     </nav>
     <div id="tab-files" class="workspace-pane" role="tabpanel" aria-label="Files" hidden>
       <div id="files-layout">
+        <form id="file-upload" aria-label="Upload file">
+          <input id="file-upload-file" type="file" aria-label="Choose file" required>
+          <input id="file-upload-path" type="text" placeholder="Destination path" aria-label="Destination path" required>
+          <button type="submit">Upload</button>
+          <small id="file-upload-status" role="status" aria-live="polite"></small>
+        </form>
         <div id="file-list" aria-label="Files"></div>
         <div class="split-resizer" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="Resize file list"></div>
         <section id="file-view" aria-label="File preview">Select a file to view it</section>

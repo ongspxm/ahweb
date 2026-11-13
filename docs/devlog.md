@@ -14,10 +14,9 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
-## 2026-11-14 TODO. webui file tab, upload file
-webui in file tab, add a top bar at the top panel
-2 inputs. type=file and type=text for the filepath.
-api changes: need the file endpoint to support upload
+## 2026-11-14 DONE. webui file tab, upload file
+webui file tab has an upload bar with file picker and destination path.
+POST /api/file uploads within the worktree, creates missing folders, and confirms before replacing an existing file.
 
 ## 2026-11-14 DONE. webui git tab, dload full patch
 webui in git tab, add a btn to dload the entire patch

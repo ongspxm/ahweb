@@ -1,9 +1,15 @@
 const eleFileList = document.querySelector("#file-list"),
+	eleUploadForm = document.querySelector("#file-upload"),
+	eleUploadFile = document.querySelector("#file-upload-file"),
+	eleUploadPath = document.querySelector("#file-upload-path"),
+	eleUploadStatus = document.querySelector("#file-upload-status"),
 	eleFileView = document.querySelector("#file-view");
 let fileListRequest = 0,
-	fileViewRequest = 0;
+	fileViewRequest = 0,
+	activeFileRoot = "";
 
 window.apiLoadFiles = async (root) => {
+	activeFileRoot = root;
 	const request = ++fileListRequest;
 	fileViewRequest++;
 	eleFileList.replaceChildren();
@@ -176,3 +182,59 @@ window.apiLoadFiles = async (root) => {
 
 	await _loadDirectory(".", eleFileList);
 };
+
+eleUploadFile.addEventListener("change", () => {
+	if (eleUploadFile.files[0]) eleUploadPath.value = eleUploadFile.files[0].name;
+});
+
+eleUploadForm.addEventListener("submit", async (event) => {
+	event.preventDefault();
+	const root = activeFileRoot,
+		file = eleUploadFile.files[0],
+		path = eleUploadPath.value.trim();
+	if (!root) {
+		eleUploadStatus.textContent = "Select a worktree first";
+		return;
+	}
+	if (!file || !path) {
+		eleUploadStatus.textContent = "Choose a file and enter its destination path";
+		return;
+	}
+
+    // double upload to chk whether to replace
+	const params = new URLSearchParams({ folder: root, path });
+	let overwrite = false;
+	try {
+		const existing = await fetch(`/api/file?${params}`);
+		if (existing.ok) {
+			const isDirectory = !existing.headers.has("content-disposition");
+			await existing.body?.cancel();
+			if (isDirectory)
+				throw new Error("Destination is a folder");
+			if (!window.confirm(`Replace ${path}?`)) return;
+			overwrite = true;
+		} else if (existing.status === 404) {
+			await existing.body?.cancel();
+		} else {
+			const body = await existing.json();
+			throw new Error(body.error || "Could not check destination");
+		}
+
+		eleUploadStatus.textContent = "Uploading…";
+		const body = new FormData();
+		body.append("file", file);
+		body.append("path", path);
+		if (overwrite) body.append("overwrite", "true");
+		const response = await fetch(
+			`/api/file?folder=${encodeURIComponent(root)}`,
+			{ method: "POST", body },
+		);
+		const result = await response.json();
+		if (!response.ok) throw new Error(result.error || "Upload failed");
+		eleUploadStatus.textContent = `Uploaded ${result.path}`;
+		eleUploadFile.value = "";
+		if (activeFileRoot === root) await window.apiLoadFiles(root);
+	} catch (err) {
+		eleUploadStatus.textContent = err.message;
+	}
+});

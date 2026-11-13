@@ -47,6 +47,7 @@ All fields required unless marked optional.
     - untracked files are shown as additions
     - file=. returns the full patch as raw text
 - `GET /api/file?folder=...&path=...` returns immediate children as `{"dirs": [...], "files": [...]}` for directories, or raw bytes with inline content type for files. Missing, outside-folder, or non-regular paths error.
+- `POST /api/file?folder=...` accepts multipart `file` and folder-relative `path`; missing destination directories are created. Optional `overwrite=true` replaces an existing regular file; returns `{"path":"..."}`.
 
 ### Sessions & chat
 - `GET /api/list?folder=...` lists sessions for a folder.
