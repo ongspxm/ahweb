@@ -488,27 +488,7 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	if err != nil || header.ID != s.ID {
 		return fmt.Errorf("Prime session %q was not found", s.ID)
 	}
-	entries, err := os.ReadDir(filepath.Dir(sessionPath))
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" || entry.Name() == filepath.Base(sessionPath) {
-			continue
-		}
-		child, err := os.Open(filepath.Join(filepath.Dir(sessionPath), entry.Name()))
-		if err != nil {
-			continue
-		}
-		var childHeader struct {
-			ParentSession string `json:"parentSession"`
-		}
-		err = json.NewDecoder(bufio.NewReader(child)).Decode(&childHeader)
-		_ = child.Close()
-		if err == nil && childHeader.ParentSession == sessionPath {
-			return errors.New("cannot delete a Prime session with child sessions")
-		}
-	}
+	// actually delete
 	if err := a.Connect(s, false); err != nil {
 		return err
 	}

@@ -405,27 +405,6 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	if sessionPath == "" {
 		return fmt.Errorf("Pi session %q was not found", s.ID)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" || filepath.Join(dir, entry.Name()) == sessionPath {
-			continue
-		}
-		file, err := os.Open(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			continue
-		}
-		var header struct {
-			ParentSession string `json:"parentSession"`
-		}
-		err = json.NewDecoder(bufio.NewReader(file)).Decode(&header)
-		_ = file.Close()
-		if err == nil && header.ParentSession != "" {
-			parent, _ := filepath.Abs(header.ParentSession)
-			current, _ := filepath.Abs(sessionPath)
-			if filepath.Clean(parent) == filepath.Clean(current) {
-				return errors.New("cannot delete a Pi session with child sessions")
-			}
-		}
-	}
 	if err := a.CleanUp(s); err != nil {
 		return err
 	}

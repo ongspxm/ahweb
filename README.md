@@ -83,6 +83,9 @@ these are session admin fns and should be implemented under "=== session admin f
 - `CleanUp(*Session) error` closes resources owned by one session.
 - `CanDelete() bool` reports whether session deletion is supported.
 - `Delete(*Session) error` permanently deletes a session. Run this from the poll worker.
+    - let's simplify the logic: no need to care about "child sessions", just delete
+    - rationale: if child session, its deleted based on time anyways, so should be deleted too
+    - on webui it doesnt spoil too, if have parentID, but parent no exist, webui handles well
 
 these are session fns (actually control the flow of the session) and should be impleted in "=== session fns" header
 - `SendPrompt(*Session) error` sends `Session.SendingMsg` and its `Session.SendingImages`.
