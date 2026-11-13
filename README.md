@@ -122,7 +122,8 @@ Run checks with `go build ./...` and `go test ./...`.
 - when daemon is down on Connect(), we will have logic to start it up (dial loop)
 - CleanUp() might actually kill the session (if we are the only one using it -- aka stop the prime ipynb)
 - Connect() calls get_state to check if connection is alive
-- prime adapter doesnt really have partial poll, it always do full poll
+- entire Adapter has one connEvt0 (for updates) and one connCmd0 (for rpc calls)
+- new user msg will trigger full tree lookup (for rewindID)
 
 ### opencode notes
 - must let opencode populate the ID for free-tier models.
