@@ -38,6 +38,8 @@
 # main_xxx.go files convention
 - each "group of features" should have their own main_xxx.go file, with the corresponding main_xxx_test.go file
 - main.go is strictly for plumping for the api only. creating connection, the paths, etc etc
+- any test written should not be testing the "small item", we should be testing in a "more integration test" style, so that the test touches more stuff
+    - eg: when testing the handleXXX fns we should always aim to test at api request and response level, instead of testing the handleXXX() directly
 
 # ui hotkeys, action dialog
 - always group and order the actions according to some logical grouping (even for those without hotkeys)
