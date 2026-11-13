@@ -187,6 +187,44 @@ func (a *app) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if file := r.URL.Query().Get("file"); file == "." {
+		// gitcmd0 - for showing tracked diffs
+		out, err := exec.Command("git", "-C", folder, "diff", "HEAD", "--", ".").Output()
+		if err != nil {
+			apiWriteError(w, http.StatusBadRequest, "could not read git diff")
+			return
+		}
+
+		// gitcmd1 - for adding all the new files into the patch
+		untracked, err := exec.Command("git", "-C", folder, "ls-files", "--others", "--exclude-standard", "-z").Output()
+		if err != nil {
+			apiWriteError(w, http.StatusBadRequest, "could not read git diff")
+			return
+		}
+		for _, file := range strings.Split(string(untracked), "\x00") {
+			if file == "" {
+				continue
+			}
+			patch, err := exec.Command("git", "-C", folder, "diff", "--no-index", "/dev/null", "--", filepath.FromSlash(file)).Output()
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				err = nil
+			}
+			if err != nil {
+				apiWriteError(w, http.StatusBadRequest, "could not read git diff")
+				return
+			}
+			if len(out) > 0 && out[len(out)-1] != '\n' {
+				out = append(out, '\n')
+			}
+			out = append(out, patch...)
+		}
+
+		// send result
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(out)
+		return
+	}
 	if file := r.URL.Query().Get("file"); file != "" {
 		path := filepath.Clean(filepath.FromSlash(file))
 		if filepath.IsAbs(path) || path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {

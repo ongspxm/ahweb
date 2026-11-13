@@ -27,6 +27,14 @@ window.apiLoadGit = async (folder) => {
 			throw new Error(body.error || "Could not load Git status");
 		if (request !== gitListRequest) return;
 		eleGitFiles.replaceChildren();
+		const patchLink = document.createElement("a"),
+			patchParams = new URLSearchParams({ folder, file: "." });
+		patchLink.className = "git-patch-link";
+		patchLink.href = `/api/git?${patchParams}`;
+		patchLink.target = "_blank";
+		patchLink.rel = "noopener";
+		patchLink.textContent = "Open full patch in new tab";
+		eleGitFiles.append(patchLink);
 		if (!(body.files || []).length) {
 			_message(eleGitFiles, "Working tree clean");
 			return;

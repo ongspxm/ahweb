@@ -204,6 +204,12 @@ func TestGitHandlerListsChangesAndReturnsDiff(t *testing.T) {
 	if res.Code != 200 || json.Unmarshal(res.Body.Bytes(), &diff) != nil || !strings.Contains(diff.Diff, "-base") || !strings.Contains(diff.Diff, "+working") {
 		t.Fatalf("diff response: %d %s", res.Code, res.Body.String())
 	}
+	q.Set("file", ".")
+	res = testRequest((&app{}).handleGit, "GET", "/api/git?"+q.Encode(), "")
+	patch := res.Body.String()
+	if res.Code != 200 || res.Header().Get("Content-Type") != "text/plain; charset=utf-8" || !strings.Contains(patch, "-base") || !strings.Contains(patch, "+working") || !strings.Contains(patch, "+new") {
+		t.Fatalf("full patch response: %d %q %s", res.Code, res.Header().Get("Content-Type"), patch)
+	}
 	q.Set("file", oddName)
 	res = testRequest((&app{}).handleGit, "GET", "/api/git?"+q.Encode(), "")
 	if res.Code != 200 || json.Unmarshal(res.Body.Bytes(), &diff) != nil || !strings.Contains(diff.Diff, "+new") {
