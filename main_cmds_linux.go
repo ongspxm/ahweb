@@ -68,6 +68,17 @@ func serviceLogs() error {
 }
 
 func serviceRestart() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	unitPath := filepath.Join(home, ".config", "systemd", "user", serviceName)
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		fmt.Println("run ahweb install")
+		return nil
+	} else if err != nil {
+		return err
+	}
 	return runServiceManager("systemctl", "--user", "restart", serviceName)
 }
 

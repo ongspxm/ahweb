@@ -70,6 +70,13 @@ func serviceRestart() error {
 	if err != nil {
 		return err
 	}
+	servicePlist := filepath.Join(account.HomeDir, "Library", "LaunchAgents", serviceLabel+".plist")
+	if _, err := os.Stat(servicePlist); os.IsNotExist(err) {
+		fmt.Println("run ahweb install")
+		return nil
+	} else if err != nil {
+		return err
+	}
 	return runServiceManager("launchctl", "kickstart", "-k", "gui/"+account.Uid+"/"+serviceLabel)
 }
 
