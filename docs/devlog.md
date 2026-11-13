@@ -13,8 +13,28 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 
 potential backlog:
 - fork
-- webui git tab, dload patch
-- webui fil tab, uload files
+
+## 2026-11-14 TODO. webui file tab, upload file
+webui in file tab, add a top bar at the top panel
+2 inputs. type=file and type=text for the filepath.
+api changes: need the file endpoint to support upload
+
+## 2026-11-14 DONE. webui git tab, dload full patch
+webui in git tab, add a btn to dload the entire patch
+
+api changes: /git with file=. should return all the files patches
+webui. add btn at the top of the top part of git tab.
+0.75rem text. it should open a link to the /git with file=.
+open in new tab.
+
+## 2026-11-14 DONE. cursor adpater missing live evts
+webui. seems like we missing some msgs
+api returns busy=false before we return the full list of events
+
+dig: stdout go func sets busy=false when cursor-agent exits.
+
+if we set busy=false only in Poll()
+this should be safe (since Poll() guarantees that session.Events is populated)
 
 ## 2026-11-12 DONE. unqueue msgs from session
 i want to remove queued msg, but dun wan stop.
@@ -102,6 +122,18 @@ we can have many child sessions, we dun always read it
 we dun wan the worktree to keep showing pending, we are ok for subsessions to be unread.
 but any session that's busy should mark worktree busy
 
+## 2026-11-13 DONE. show Codex context compaction
+codex got auto compact but we dun see it, just see the token usage drop
+now adapter will render those as assistant msgs
+
+## 2026-11-11 DONE. use first user msg as title
+we dun want to use session title anymore
+pi and opencode dun retitle their session title
+after a rewind, so the title will be off.
+
+make add adapters just use first user msg as title
+remove the session title, clean it up
+
 ## 2026-11-11 DONE. opencode session wrong token usage
 webui. opencode session showed 0% token usage in webui
 dig: context tokens needs to be updated using last completed assistant message,
@@ -152,6 +184,7 @@ rewind is per message; hide the button when an event has no rewindID.
 when clicked it will send a /rewind api call
 the api call should return the "text prompt" and "full event history"
 if busy or rewind fails, return an API error and show it with setError()
+"full event history" will be everything from up to the event right before rewindID
 
 the text prompt will be used to populate the prompt textbox
 (similar to the stop btn, also restore imgs)

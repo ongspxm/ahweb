@@ -2,6 +2,9 @@
 A small local web client for various harnesses.
 config is stored in `~/.ahweb/config.json`
 
+![Desktop screenshot](img_desktop.png)
+![Mobile screenshot](img_mobile.png)
+
 ```
 # install or update local copy of ahweb
 go install github.com/ongspxm/ahweb@latest
@@ -13,6 +16,10 @@ ahweb --port 8000
 # install ahweb daemon (linux uses systemd, macos use launchd)
 ahweb install
 ahweb --port 8000 install
+
+# updating a existing installation
+go install github.com/ongspxm/ahweb@latest
+ahweb restart
 
 # more info
 ahweb help
@@ -36,7 +43,9 @@ All fields required unless marked optional.
 - `POST /api/delproject?folder=...` removes project from folder roots.
 - `GET /api/worktrees?folder=...` lists worktrees, including the main checkout, as `{ "branch": "...", "dirname": "..." }`. For detached worktrees, `branch` is `"(detached) <first 7 chars of commit>"`; it is empty when unavailable.
 - `GET /api/git?folder=...` returns changed files as `{ "files": [{ "status": " M", "path": "..." }] }`, using Git's two-character porcelain status.
-- `GET /api/git?folder=...&file=...` returns `{ "diff": "..." }` combining staged and unstaged changes; untracked files are shown as additions. Invalid folders or files return an API error.
+- `GET /api/git?folder=...&file=...` returns `{ "diff": "..." }` combining staged and unstaged changes
+    - untracked files are shown as additions
+    - file=. returns the full patch as raw text
 - `GET /api/file?folder=...&path=...` returns immediate children as `{"dirs": [...], "files": [...]}` for directories, or raw bytes with inline content type for files. Missing, outside-folder, or non-regular paths error.
 
 ### Sessions & chat
@@ -51,6 +60,7 @@ All fields required unless marked optional.
     - Returns `sessid`, `harness`, `queued`, `queued_images`, and `busy`.
 - `POST /api/stop?folder=...&sessid=...&harness=...` stops a session. Returns `sessid`, `busy`, `queued`, and `queued_images`; waiting and in-flight content is cleared and returned for restoring in the prompt box.
 - `POST /api/unqueue?folder=...&sessid=...&harness=...` clears and returns waiting `queued` text and `queued_images` without stopping the active operation.
+- `POST /api/rewind?folder=...&sessid=...&harness=...&rewind_id=...` rewinds an idle session. Returns `prompt`, `prompt_images`, and the refreshed full event history
 - `POST /cleanup?confirm=0&days=8` previews deletion of sessions older than 8 days across all worktrees. Returns `{"planid":"...","data":{"folder":N}}`. `days` is a required nonnegative integer.
 - `POST /cleanup?confirm=1&plan=...` deletes the previewed candidates. Returns `{"data":{"folder":N}}` (plus `error` on partial failures, HTTP 207).
 - `GET /api/cli?folder=...&offset=...` is a WebSocket terminal stream. The optional byte `offset` resumes output; the server first sends a text `{"type":"offset","offset":N}` frame, then binary terminal output.
@@ -78,6 +88,7 @@ these are session fns (actually control the flow of the session) and should be i
 - `SendPrompt(*Session) error` sends `Session.SendingMsg` and its `Session.SendingImages`.
 - `Poll(*Session) error` refreshes session events, title/first user message, and usage stats.
     - When `DoFullHistory` is set, it should load full history; otherwise it may load only new events.
+- `Rewind(*Session, rewindID)` rewinds to an event ID. Run this from the poll worker.
 - `Stop(*Session) error` stops the active session operation.
 
 Session adapter calls are run by the poll worker, except `Stop`, which the stop API calls directly.
@@ -99,30 +110,36 @@ Run checks with `go build ./...` and `go test ./...`.
 | Parent session IDs | Y | Y | Y | Y | N | N |
 | Tool results in saved history | Y | Y | Y | Y | ? | Y |
 | Delete | Y | ? | Y | Y | N | N |
+| Rewind | Y | N | Y | Y | N | N |
 
 ### pi notes
 - each sess start one pi cli rpc
 - listSessions() pull info from jsonl files
+- rewind loads a small embedded RPC extension that navigates to the selected user entry.
 
 ### prime notes
 - listSession do pure file reading, just like in pi
 - when daemon is down on Connect(), we will have logic to start it up (dial loop)
 - CleanUp() might actually kill the session (if we are the only one using it -- aka stop the prime ipynb)
 - Connect() calls get_state to check if connection is alive
+- prime adapter doesnt really have partial poll, it always do full poll
 
 ### opencode notes
 - must let opencode populate the ID for free-tier models.
 - therefore each session will have a sessionID and a OpencodeID
 - we start a SSE sess in background to populate the "busyCli" and "events" for each session (which gets processed in Poll)
 - token count from SSE is best effort, and may overcount (will fix when big problem later)
+- rewind is a 2 stage process, first we stage the revert, then commit it
 
 ### claude notes
 - claude is cli based: means we use `claude -p` to send prompt, then read stdin for replies, it's not one long lived process
 - each process call ends up running a gofunc that listens and process into a cache, then Poll() copies cache content into Session.Events
 - claude got no parent sess id and context usage estimated hardcoded list
+- claude doesnt support headless rewind, skipping for now
 
 ### codex notes
 - one background reader handles JSON-RPC replies and notifications for the shared app-server process
+- context compaction evts appear as assistant msgs: “Context compacted.”
 - codex connection cannot have more than 1 writer (so we have isWriter to record which state it is)
 - Connect(force=true) might not actually kill because we might end a connection that has some unsaved state
 
@@ -131,3 +148,4 @@ Run checks with `go build ./...` and `go test ./...`.
 - future: maybe to swap to agents sdk, but not very stable (nor native ui to view)
 - chats are resumed through the CLI, and saved history is read from Cursor's local `~/.cursor/projects` transcripts.
 - reading tool call from transcript doesnt return result, or success state
+- doesnt support headless rewind
