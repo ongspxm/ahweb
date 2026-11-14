@@ -115,6 +115,10 @@ Run checks with `go build ./...` and `go test ./...`.
 | Tool results in saved history | Y | Y | Y | Y | ? | Y |
 | Delete | Y | ? | Y | Y | N | N |
 | Rewind | Y | N | Y | Y | N | N |
+| Full transcript thru files | N | N | N | N | Y | Y |
+| Session ctrl thru global daemon | N | Y | Y | Y | N | N |
+| Session ctrl thru isolated RPC | Y | N | N | N | N | N |
+| Session ctrl thru short-lived cmd stdout | N | N | N | N | Y | Y |
 
 ### pi notes
 - each sess start one pi cli rpc
@@ -143,10 +147,11 @@ Run checks with `go build ./...` and `go test ./...`.
 - claude doesnt support headless rewind, skipping for now
 
 ### codex notes
-- one background reader handles JSON-RPC replies and notifications for the shared app-server process
+- one single rpc conn for cmds
+- one single conn for lsitening to events
+- poll will drain the events during Poll()
 - context compaction evts appear as assistant msgs: “Context compacted.”
-- codex connection cannot have more than 1 writer (so we have isWriter to record which state it is)
-- Connect(force=true) might not actually kill because we might end a connection that has some unsaved state
+- each codex chat can only have one write connection (so we will set it as readonly when possible)
 
 ### cursor notes
 - cursor-agent doesn't provide context usage or parent session IDs
