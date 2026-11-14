@@ -77,10 +77,13 @@ func (d *connBase) closeLocked() {
 	}
 }
 
-func (d *connBase) isConnected() bool {
+func (d *connBase) chkConnection() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.socket != nil
+	if d.socket == nil {
+		return errDaemonUnavailable
+	}
+	return nil
 }
 
 // === command connection

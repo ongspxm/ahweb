@@ -361,7 +361,7 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
 
-	if !connCmd0.isConnected() {
+	if err := connCmd0.chkConnection(); err != nil {
 		if err := a.Ready(); err != nil {
 			return err
 		}
@@ -606,8 +606,11 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" || !connCmd0.isConnected() {
+	if conn.ActiveSessionID == "" {
 		return errors.New("prime session is not connected")
+	}
+	if err := connCmd0.chkConnection(); err != nil {
+		return err
 	}
 
 	// setting the models
@@ -658,7 +661,7 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" || !connCmd0.isConnected() {
+	if conn.ActiveSessionID == "" || connCmd0.chkConnection() != nil {
 		return nil
 	}
 	err = conn.call("abort", nil, nil)
@@ -675,8 +678,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" || !connCmd0.isConnected() {
+	if conn.ActiveSessionID == "" {
 		return errors.New("prime session is not connected")
+	}
+	if err := connCmd0.chkConnection(); err != nil {
+		return err
 	}
 
 	s.Mu.Lock()
@@ -691,6 +697,12 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		s.Mu.Unlock()
 	}
 	updates, needsFull := connEvt0.drainSub(conn.ActiveSessionID)
+	committed := false
+	defer func() {
+		if !committed {
+			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
+		}
+	}()
 	full = full || needsFull
 
 	type primeMessage struct {
@@ -771,13 +783,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			Messages []primeMessage `json:"messages"`
 		}
 		if err := conn.call("get_messages", nil, &messagesResponse); err != nil {
-			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 			return err
 		}
 		messages = messagesResponse.Messages
 		var tree primeTree
 		if err := conn.call("get_session_tree", nil, &tree); err != nil {
-			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 			return err
 		}
 		byID := make(map[string]int, len(tree.FlatNodes))
@@ -817,7 +827,6 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		// we need to find rewindID (therefore poll whole tree)
 		var tree primeTree
 		if err := conn.call("get_session_tree", nil, &tree); err != nil {
-			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 			return err
 		}
 		byID := make(map[string]int, len(tree.FlatNodes))
@@ -856,7 +865,6 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			}
 		}
 		if len(branchUsers) < userMessages {
-			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 			return nil
 		}
 		nextBranchUser := 0
@@ -972,7 +980,6 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		} `json:"contextUsage"`
 	}
 	if err := conn.call("get_session_stats", nil, &stats); err != nil {
-		connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 		return err
 	}
 	var state struct {
@@ -980,7 +987,6 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		IsCompacting bool `json:"isCompacting"`
 	}
 	if err := conn.call("get_state", nil, &state); err != nil {
-		connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
 		return err
 	}
 	if refreshMessages {
@@ -1023,6 +1029,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		}
 	}
 	s.DoFullHistory = false
+	committed = true
 	return nil
 }
 
