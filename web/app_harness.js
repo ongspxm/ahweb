@@ -479,7 +479,7 @@ function renderEvents(list) {
 		h.append(label);
 		if (role === "YOU" && rewindID) {
 			const button = document.createElement("button");
-			button.className = "outline secondary";
+			button.className = "outline";
 			button.type = "button";
 			button.title = "Rewind to this message";
 			button.setAttribute("aria-label", button.title);

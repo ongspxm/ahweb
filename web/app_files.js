@@ -184,7 +184,7 @@ window.apiLoadFiles = async (root) => {
 };
 
 eleUploadFile.addEventListener("change", () => {
-	if (eleUploadFile.files[0]) eleUploadPath.value = eleUploadFile.files[0].name;
+	if (eleUploadFile.files[0] && !eleUploadPath.value.trim()) eleUploadPath.value = eleUploadFile.files[0].name;
 });
 
 eleUploadForm.addEventListener("submit", async (event) => {
