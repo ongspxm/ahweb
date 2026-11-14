@@ -36,7 +36,7 @@ type itemEventRef struct {
 	completed bool
 }
 
-type conn struct {
+type SessionConn struct {
 	mu                 sync.Mutex
 	codexThreadID      string
 	codexTurnID        string
@@ -46,20 +46,19 @@ type conn struct {
 	errors             []harness.Event
 	isLoaded           bool
 	eventRefs          map[string]itemEventRef
-	eventCache         []cachedEvent
+	eventCache         []connEvent
 }
 
 var (
 	cacheMu   sync.Mutex
-	conns     = map[string]map[string]*conn{}
+	conns     = map[string]map[string]*SessionConn{}
 	threadIDs = map[string]map[string]string{}
 )
 
-func (*Adapter) Ready() error { _, err := openStream(); return err }
+func (*Adapter) Ready() error { return ensureRPC() }
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
-	_, err := openStream()
-	if err != nil {
+	if err := ensureRPC(); err != nil {
 		return nil, err
 	}
 	models := map[string]harness.Model{}
@@ -69,7 +68,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 		if cursor != "" {
 			params["cursor"] = cursor
 		}
-		raw, _, err := processRPC.call("model/list", params)
+		raw, _, err := connRPC0.call("model/list", params)
 		if err != nil {
 			return nil, err
 		}
@@ -106,8 +105,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 }
 
 func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
-	_, err := openStream()
-	if err != nil {
+	if err := ensureRPC(); err != nil {
 		return nil, err
 	}
 	var sessions []harness.SessionLite
@@ -123,7 +121,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		if cursor != "" {
 			params["cursor"] = cursor
 		}
-		raw, _, err := processRPC.call("thread/list", params)
+		raw, _, err := connRPC0.call("thread/list", params)
 		if err != nil {
 			return nil, err
 		}
@@ -179,25 +177,28 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	}
 	cacheMu.Unlock()
 	// History refreshes must not resume a healthy, possibly unsaved thread.
-	if cached != nil {
-		if processRPC != nil && processRPC.status() == nil {
+	if cached != nil && connRPC0 != nil && connRPC0.chkConnection() == nil {
+		connRPC0.mu.Lock()
+		registered := connRPC0.threads[threadID] != nil
+		connRPC0.mu.Unlock()
+		if registered {
 			return nil
 		}
 	}
 
 	// startup the connection
 	_ = a.CleanUp(s)
-	c, err := openStream()
-	if err != nil {
+	if err := ensureRPC(); err != nil {
 		return err
 	}
+	c := &SessionConn{eventRefs: map[string]itemEventRef{}}
 	method := "thread/start"
 	params := map[string]any{"cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}
 	if threadID != "" {
 		method = "thread/read"
 		params = map[string]any{"threadId": threadID}
 	}
-	raw, _, err := processRPC.call(method, params)
+	raw, _, err := connRPC0.call(method, params)
 	if err != nil {
 		return err
 	}
@@ -218,9 +219,9 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	c.codexThreadID = result.Thread.ID
 	c.isWriter = method == "thread/start"
 	c.mu.Unlock()
-	processRPC.mu.Lock()
-	processRPC.threads[result.Thread.ID] = c
-	processRPC.mu.Unlock()
+	connRPC0.mu.Lock()
+	connRPC0.threads[result.Thread.ID] = c
+	connRPC0.mu.Unlock()
 	cacheMu.Lock()
 
 	if isLocal {
@@ -230,7 +231,7 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 		threadIDs[s.RealPath][id] = result.Thread.ID
 	}
 	if conns[s.RealPath] == nil {
-		conns[s.RealPath] = map[string]*conn{}
+		conns[s.RealPath] = map[string]*SessionConn{}
 	}
 	conns[s.RealPath][id] = c
 	cacheMu.Unlock()
@@ -250,16 +251,16 @@ func (a *Adapter) CleanUp(s *harness.Session) error {
 		c.mu.Unlock()
 
 		// if its writer, we actually unsub to try to give back control to other clients
-		if processRPC != nil {
-			if isWriter && processRPC.status() == nil {
-				_, _, err := processRPC.call("thread/unsubscribe", map[string]any{"threadId": threadID})
+		if connRPC0 != nil {
+			if isWriter && connRPC0.chkConnection() == nil {
+				_, _, err := connRPC0.call("thread/unsubscribe", map[string]any{"threadId": threadID})
 				if err != nil {
 					return err
 				}
 			}
-			processRPC.mu.Lock()
-			delete(processRPC.threads, threadID)
-			processRPC.mu.Unlock()
+			connRPC0.mu.Lock()
+			delete(connRPC0.threads, threadID)
+			connRPC0.mu.Unlock()
 		}
 
 		c.mu.Lock()
@@ -305,12 +306,12 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	if err := a.CleanUp(s); err != nil {
 		return err
 	}
-	_, _, err := processRPC.call("thread/delete", map[string]any{"threadId": threadID})
+	_, _, err := connRPC0.call("thread/delete", map[string]any{"threadId": threadID})
 	return err
 }
 
 func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
-	c, err := getConn(s)
+	c, err := a.sessionConn(s)
 	if err != nil {
 		return err
 	}
@@ -318,21 +319,21 @@ func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
 	threadID, isWriter := c.codexThreadID, c.isWriter
 	c.mu.Unlock()
 	if !isWriter {
-		if _, _, err := processRPC.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
+		if _, _, err := connRPC0.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
 			return err
 		}
 		c.mu.Lock()
 		c.isWriter = true
 		c.mu.Unlock()
 	}
-	_, _, err = processRPC.call("thread/revert", map[string]any{"threadId": threadID, "beforeTurnId": rewindID})
+	_, _, err = connRPC0.call("thread/revert", map[string]any{"threadId": threadID, "beforeTurnId": rewindID})
 	return err
 }
 
 // === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
-	c, err := getConn(s)
+	c, err := a.sessionConn(s)
 	if err != nil {
 		return err
 	}
@@ -356,7 +357,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 
 	// swap the connection to write (if needed)
 	if !isWriter {
-		if _, _, err := processRPC.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
+		if _, _, err := connRPC0.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
 			return err
 		}
 		c.mu.Lock()
@@ -372,7 +373,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	if effort != "" {
 		params["effort"] = effort
 	}
-	raw, _, err := processRPC.call("turn/start", params)
+	raw, _, err := connRPC0.call("turn/start", params)
 	if err != nil {
 		return err
 	}
@@ -396,7 +397,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 }
 
 func (a *Adapter) Stop(s *harness.Session) error {
-	c, err := getConn(s)
+	c, err := a.sessionConn(s)
 	if err != nil {
 		return nil
 	}
@@ -406,15 +407,22 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	if turn == "" {
 		return nil
 	}
-	_, _, err = processRPC.call("turn/interrupt", map[string]any{"threadId": c.codexThreadID, "turnId": turn})
+	_, _, err = connRPC0.call("turn/interrupt", map[string]any{"threadId": c.codexThreadID, "turnId": turn})
 	return err
 }
 
 func (a *Adapter) Poll(s *harness.Session) error {
-	c, err := getConn(s)
+	c, err := a.sessionConn(s)
 	if err != nil {
 		return err
 	}
+	updates := c.drain()
+	committed := false
+	defer func() {
+		if !committed {
+			c.undrain(updates)
+		}
+	}()
 
 	_itemText := func(item map[string]any) string {
 		if text, ok := item["text"].(string); ok {
@@ -738,18 +746,14 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	threadID := c.codexThreadID
 	c.mu.Unlock()
 	_processEvents := func(afterSequence uint64, includeBeforeSnapshotItems bool) {
-		c.mu.Lock()
-		events := c.eventCache
-		c.eventCache = nil
-		c.mu.Unlock()
-		for _, event := range events {
+		for _, event := range updates {
 			afterSnapshot := event.sequence > afterSequence
 			_onEvent(event.method, event.params, includeBeforeSnapshotItems || afterSnapshot, afterSnapshot)
 		}
 	}
 
 	params := map[string]any{"threadId": threadID}
-	raw, responseSequence, err := processRPC.call("thread/read", params)
+	raw, responseSequence, err := connRPC0.call("thread/read", params)
 	if err != nil {
 		// the first few reads when the session is init-ing might fail...
 		// try for 30s, else turn the state to busy=false
@@ -802,7 +806,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			if cursor != "" {
 				params["cursor"] = cursor
 			}
-			pageRaw, _, err := processRPC.call("thread/turns/list", params)
+			pageRaw, _, err := connRPC0.call("thread/turns/list", params)
 			if err != nil {
 				// here we allow some errs to be skipped
 				if strings.Contains(err.Error(), "list_turns is not supported yet") || cursor == "" && strings.Contains(err.Error(), "thread/turns/list is unavailable before first user message") {
@@ -886,7 +890,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 
 	var fullCost float64
 	hasCost := false
-	if raw, _, usageErr := processRPC.call("account/usage/read", map[string]any{"threadId": threadID}); usageErr == nil {
+	if raw, _, usageErr := connRPC0.call("account/usage/read", map[string]any{"threadId": threadID}); usageErr == nil {
 		var result struct {
 			ThreadUsage *struct {
 				EstimatedUsdMicros      *int64 `json:"estimatedUsdMicros"`
@@ -916,12 +920,13 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		s.FullCost = fullCost
 	}
 	s.Mu.Unlock()
+	committed = true
 	return nil
 }
 
-// === utils fns
+// === util fns
 
-func getConn(s *harness.Session) (*conn, error) {
+func (a *Adapter) sessionConn(s *harness.Session) (*SessionConn, error) {
 	cacheMu.Lock()
 	s.Mu.Lock()
 	id := s.ID
@@ -931,10 +936,10 @@ func getConn(s *harness.Session) (*conn, error) {
 	if c == nil {
 		return nil, errors.New("Codex session is not connected")
 	}
-	if processRPC == nil {
-		return nil, errors.New("Codex App Server is not connected")
+	if connRPC0 == nil {
+		return nil, errors.New("Codex app-server is not connected")
 	}
-	if err := processRPC.status(); err != nil {
+	if err := connRPC0.chkConnection(); err != nil {
 		return nil, err
 	}
 	return c, nil
