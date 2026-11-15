@@ -2,8 +2,7 @@
 A small local web client for various harnesses.
 config is stored in `~/.ahweb/config.json`
 
-![Desktop screenshot](img_desktop.png)
-![Mobile screenshot](img_mobile.png)
+![screenshot](sshot.png)
 
 ```
 # install or update local copy of ahweb
