@@ -90,9 +90,20 @@ func ensureRPC() error {
 		}
 
 		// the daemon is global: start it if needed and reuse it across ahweb restarts
-		raw, err := exec.Command("codex", "app-server", "daemon", "start").CombinedOutput()
+		cmd := exec.Command("codex", "app-server", "daemon", "start")
+		raw, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("could not start Codex app-server daemon: %v: %s", err, strings.TrimSpace(string(raw)))
+			detail := strings.TrimSpace(string(raw))
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+					if detail != "" {
+						detail += "\n"
+					}
+					detail += stderr
+				}
+			}
+			return nil, fmt.Errorf("could not start Codex app-server daemon: %v: %s", err, detail)
 		}
 		var status struct {
 			SocketPath string `json:"socketPath"`

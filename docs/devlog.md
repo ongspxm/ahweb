@@ -14,6 +14,11 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
+## 2026-11-18 DONE. codex daemon parse only stdout
+codex daemon starts with json parsing err
+dig: seems to be result of merging the stdout and stderr into CombinedOuptut()
+fix: only parse stdout, put stderr to errors.
+
 ## 2026-11-14 DONE. webui file tab, upload file
 webui file tab has an upload bar with file picker and destination path.
 POST /api/file uploads within the worktree, creates missing folders, and confirms before replacing an existing file.
