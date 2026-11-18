@@ -134,7 +134,7 @@ func launchdPlist(executable, home, logDir, path string, port int) []byte {
 	write(home)
 	b.WriteString(`</string><key>PATH</key><string>`)
 	write(path)
-	b.WriteString(`</string><key>TERM</key><string>xterm</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>`)
+	b.WriteString(`</string><key>TERM</key><string>tmux-256color</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>`)
 	write(filepath.Join(logDir, "stdout.log"))
 	b.WriteString(`</string><key>StandardErrorPath</key><string>`)
 	write(filepath.Join(logDir, "stderr.log"))
