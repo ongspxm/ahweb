@@ -113,7 +113,7 @@ function setNotice(id, message) {
 		item.setAttribute("role", key === "error" ? "alert" : "status");
 		content.textContent = text;
 		dismiss.type = "button";
-		dismiss.className = "outline secondary project-remove";
+		dismiss.className = "outline secondary btn-cleanup";
 		dismiss.setAttribute("aria-label", "Dismiss notice");
 		dismiss.innerHTML = '<i data-lucide="x"></i>';
 		dismiss.addEventListener("click", () => setNotice(key, ""));
@@ -123,6 +123,8 @@ function setNotice(id, message) {
 	eleNoticeArea.hidden = notices.size === 0;
 	if (window.lucide) window.lucide.createIcons();
 }
+
+window.setNotice = setNotice;
 
 function setError(message) {
 	setNotice("error", message || "");
@@ -354,6 +356,7 @@ function renderSessList(f) {
 			row = document.createElement("div");
 			row.className = "session-row";
 			const b = document.createElement("button"),
+				remove = document.createElement("button"),
 				name = document.createElement("span");
 			b.dataset.sessid = s.sessid;
 			name.className = "session-name";
@@ -363,11 +366,25 @@ function renderSessList(f) {
 				apiLoadSess(folder, b.dataset.sessid);
 				elePrompt.focus();
 			});
-			row.append(b);
+			remove.className = "outline secondary btn-cleanup";
+			remove.type = "button";
+			remove.innerHTML = '<i data-lucide="x"></i>';
+			remove.addEventListener("click", async () => {
+				if (!confirm(`Permanently delete this chat?\n\n${s.sessid}`)) return;
+				try {
+					const r = await fetch(`/cleanup?folder=${enc(folder)}&sessid=${enc(s.sessid)}`, { method: "POST" }),
+						body = await r.json();
+					if (!r.ok) throw new Error(body.error || "Could not delete chat");
+					delete CACHE.chats[path][s.sessid];
+					if (sessid === s.sessid) apiLoadSess(folder, null);
+					renderSessList(folder);
+				} catch (err) { setError(err.message); }
+			});
+			row.append(b, remove);
 			cards.set(s.sessid, row);
 		}
 		const b = row.querySelector("button");
-		b.className = s.sessid === sessid ? "" : "outline";
+		b.className = `btn-item${s.sessid === sessid ? "" : " outline"}`;
 		b.title = s.sessid;
 		renderSessCard(s, b);
 		return row;
@@ -456,7 +473,7 @@ function renderEvents(list) {
 			.join(" · ");
 	}
 
-	function _card(role, meta, rewindID = "") {
+	function _card(role, meta, rewindID = "", copyText = "") {
 		const a = document.createElement("article");
 		a.classList.add(
 			role === "YOU"
@@ -477,15 +494,34 @@ function renderEvents(list) {
 		small.textContent = meta || "";
 		label.append(strong, document.createTextNode(" "), small);
 		h.append(label);
-		if (role === "YOU" && rewindID) {
+		if (role === "YOU") {
+			const actions = document.createElement("div");
+			actions.className = "message-actions";
 			const button = document.createElement("button");
 			button.className = "outline";
 			button.type = "button";
-			button.title = "Rewind to this message";
+			button.title = "Copy message";
 			button.setAttribute("aria-label", button.title);
-			button.innerHTML = '<i data-lucide="rotate-ccw"></i>';
-			button.addEventListener("click", () => apiRewind(rewindID, button));
-			h.append(button);
+			button.innerHTML = '<i data-lucide="copy"></i>';
+			button.addEventListener("click", async () => {
+				try {
+					await navigator.clipboard.writeText(copyText);
+				} catch {
+					setError("Could not copy message");
+				}
+			});
+			actions.append(button);
+			if (rewindID) {
+				const rewind = document.createElement("button");
+				rewind.className = "outline";
+				rewind.type = "button";
+				rewind.title = "Rewind to this message";
+				rewind.setAttribute("aria-label", rewind.title);
+				rewind.innerHTML = '<i data-lucide="rotate-ccw"></i>';
+				rewind.addEventListener("click", () => apiRewind(rewindID, rewind));
+				actions.append(rewind);
+			}
+			h.append(actions);
 		}
 		const body = document.createElement("div");
 		if (role === "THINKING") {
@@ -632,7 +668,7 @@ function renderEvents(list) {
 		if (e.type === "user") {
 			setError("");
 			clearQueuedPrompts();
-			const b = _card("YOU", _messageMeta(e), e.rewind_id);
+			const b = _card("YOU", _messageMeta(e), e.rewind_id, e.content || "");
 			b.textContent = e.content || "";
 			_images(b, e);
 			_closeEvents();
@@ -732,7 +768,7 @@ function renderProjectLists() {
 			const b = document.createElement("button"),
 				remove = document.createElement("button");
 			b.addEventListener("click", () => apiSelectProject(b.dataset.path));
-			remove.className = "outline secondary project-remove";
+			remove.className = "outline secondary btn-cleanup";
 			remove.type = "button";
 			remove.innerHTML = '<i data-lucide="x"></i>';
 			remove.addEventListener("click", async () => {
@@ -759,7 +795,7 @@ function renderProjectLists() {
 		}
 		const b = row.querySelector("button:first-child"),
 			remove = row.querySelector("button:last-child");
-		b.className = root === selectedProject ? "" : "outline";
+		b.className = `btn-item${root === selectedProject ? "" : " outline"}`;
 		b.dataset.path = root;
 		b.textContent = root;
 		b.title = root;
@@ -777,6 +813,7 @@ function renderProjectLists() {
 			row,
 		]),
 	);
+	const _basename = (path) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 	const worktreeRows = [];
 	for (const worktree of worktreePaths) {
 		const path = worktree.dirname;
@@ -790,9 +827,11 @@ function renderProjectLists() {
 			row.append(b);
 		}
 		const b = row.querySelector("button");
-		b.className = worktree.dirname === selectedWorktree ? "" : "outline";
+		b.className = `btn-item${worktree.dirname === selectedWorktree ? "" : " outline"}`;
 		b.dataset.path = path;
-		b.textContent = worktree.branch || worktree.dirname;
+		b.textContent = worktree.branch
+			? `${worktree.branch} ${_basename(path)}`
+			: worktree.dirname;
 		b.title = worktree.dirname;
 		const chats = Object.values(CACHE.chats[cachePath(worktree.dirname)] || {});
 		const busy = chats.some((chat) => chat.busy),
@@ -817,7 +856,6 @@ function renderProjectLists() {
 		worktreeRows.push(emptyText(eleWorktrees, "No worktrees"));
 	}
 	reconcileChildren(eleWorktrees, worktreeRows);
-	const _basename = (path) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 	eleBreadcrumbProject.textContent = selectedProject ? _basename(selectedProject) : "(empty)";
 	const selected = worktreePaths.find((worktree) => worktree.dirname === selectedWorktree);
 	eleBreadcrumbWorktree.textContent = selectedWorktree
@@ -1376,6 +1414,7 @@ elePrompt.addEventListener("keydown", (e) => {
 	if (
 		e.key === "Enter" &&
 		!e.shiftKey &&
+		!e.ctrlKey &&
 		!matchMedia("(max-width: 600px)").matches
 	) {
 		e.preventDefault();

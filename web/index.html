@@ -31,11 +31,11 @@
     #panel-sessions, #panel-workspace, #panel-chats { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
     #panel-sessions { gap: .5rem; padding: 1rem; }
     #panel-chats { overflow: hidden; }
-    .project-row, .worktree-row { display: flex; align-items: center; gap: .5rem; }
-    .project-row > button:first-child, .worktree-row button { flex: 1; min-width: 0; margin-bottom: 0; }
-    .project-row > button:focus-visible, .worktree-row > button:focus-visible, #chats-list .session-row > button:focus-visible { outline: 2px solid var(--pico-primary); outline-offset: 2px; background: var(--pico-primary); color: var(--pico-primary-inverse); }
-    .project-remove { display: grid; place-items: center; width: 1.1rem; height: 1.1rem; flex: 0 0 auto; margin: 0; padding: 0; border-radius: 50%; }
-    .project-remove svg { width: .7rem; height: .7rem; }
+    .project-row, .worktree-row, #chats-list .session-row { display: flex; align-items: center; gap: .5rem; }
+    .btn-item { flex: 1; min-width: 0; display: flex; align-items: center; gap: .4rem; margin: 0; text-align: left; }
+    .btn-item:focus-visible { outline: 2px solid var(--pico-primary); outline-offset: 2px; background: var(--pico-primary); color: var(--pico-primary-inverse); }
+    .btn-cleanup { display: grid; place-items: center; width: 1.1rem; height: 1.1rem; flex: 0 0 auto; margin: 0; padding: 0; border-radius: 50%; }
+    .btn-cleanup svg { width: .7rem; height: .7rem; }
     .status { display: inline-block; width: .55rem; height: .55rem; flex: 0 0 auto; margin-left: auto; border: 1px solid var(--pico-mark-color); border-radius: 50%; background: var(--pico-mark-background-color); }
     .status.busy { animation: pulse .5s ease-in-out infinite; }
     @keyframes pulse { 50% { opacity: .25; } }
@@ -65,14 +65,10 @@
     .section-content { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: .35rem; overflow-y: auto; overflow-wrap: anywhere; padding-top: .35rem; }
     #session-folder { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #chats-list { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: .35rem; overflow-x: hidden; overflow-y: auto; }
-    #chats-list button { display: flex; align-items: center; gap: .4rem; margin: 0; text-align: left; }
     #chats-list .session-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #chats-list details { margin: 0; padding: 0; }
     #chats-list summary { margin: 0; padding: .25rem; color: var(--pico-muted-color); }
     #chats-list .session-child { padding-left: .75rem; }
-    #chats-list .session-row { display: flex; align-items: center; gap: .5rem; }
-    #chats-list .session-row > button { flex: 1; min-width: 0; margin: 0; }
-    #chats-list .session-child button { width: 100%; }
 
     /* Status */
     #server-status { padding: .75rem; }
@@ -178,8 +174,9 @@
     #messages .chat-image { display: block; max-width: min(100%, 40rem); max-height: 32rem; margin: .5rem 0 0; border-radius: var(--pico-border-radius); object-fit: contain; }
     #messages article.you { background-color: var(--pico-primary-background); color: var(--pico-primary-inverse); }
     #messages article.you header, #messages article.you strong, #messages article.you small { color: inherit; background-color: inherit; }
-    #messages article.you header > button { --pico-color: var(--pico-primary-inverse); --pico-border-color: var(--pico-primary-inverse); display: grid; place-items: center; width: 1.5rem; height: 1.5rem; margin: 0 0 0 auto; padding: 0; }
-    #messages article.you header > button svg { width: 1rem; height: 1rem; }
+    #messages article.you header .message-actions { display: flex; align-items: center; gap: .5rem; margin-left: auto; }
+    #messages article.you .message-actions button { --pico-color: var(--pico-primary-inverse); --pico-border-color: var(--pico-primary-inverse); display: grid; place-items: center; width: 1.5rem; height: 1.5rem; margin: 0; padding: 0; }
+    #messages article.you .message-actions button svg { width: 1rem; height: 1rem; }
     #messages article.error { background-color: color-mix(in srgb, var(--pico-del-color) 10%, var(--pico-card-background-color)); }
     #messages article.error header, #messages article.error strong { color: var(--pico-del-color); }
     #queued-prompts { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -366,7 +363,7 @@
       <form id="prompt-form">
         <div id="queued-wrap" hidden>
           <blockquote id="queued-prompts" aria-label="Queued messages"></blockquote>
-          <button id="unqueue" class="outline secondary project-remove" type="button" aria-label="Unqueue message" title="Unqueue message"><i data-lucide="x"></i></button>
+          <button id="unqueue" class="outline secondary btn-cleanup" type="button" aria-label="Unqueue message" title="Unqueue message"><i data-lucide="x"></i></button>
         </div>
         <div id="prompt-wrap">
           <textarea id="prompt" name="prompt" rows="2" autocomplete="off" placeholder="Send prompt"></textarea>
