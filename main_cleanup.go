@@ -39,6 +39,12 @@ func (a *app) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+
+	// piping over the request to the single session deletion
+	if q.Get("sessid") != "" {
+		a.handleDeleteSession(w, r)
+		return
+	}
 	confirm := q.Get("confirm")
 	if confirm != "0" && confirm != "1" {
 		apiWriteError(w, http.StatusBadRequest, "confirm must be 0 or 1")
@@ -208,4 +214,70 @@ func (a *app) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiWriteJSON(w, http.StatusOK, map[string]any{"data": result})
+}
+
+func (a *app) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	folder, id := r.URL.Query().Get("folder"), r.URL.Query().Get("sessid")
+	if folder == "" || id == "" {
+		apiWriteError(w, http.StatusBadRequest, "folder and sessid are required")
+		return
+	}
+
+	// search for correct session
+	a.mu.Lock()
+	var s *harness.Session
+	for key, candidate := range a.sessions[folder] {
+		if key.id != id {
+			continue
+		}
+		if s != nil {
+			a.mu.Unlock()
+			apiWriteError(w, http.StatusConflict, "sessid is ambiguous; specify a harness")
+			return
+		}
+		s = candidate
+	}
+	a.mu.Unlock()
+	if s == nil {
+		apiWriteError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	// send the delete job into the poll loop
+	if a.pollJobs == nil {
+		apiWriteError(w, http.StatusInternalServerError, "poll workers are not running")
+		return
+	}
+	s.Mu.Lock()
+	last := s.LastTimestampMs
+	s.Mu.Unlock()
+	result := make(chan error, 1)
+	done := &sync.WaitGroup{}
+	done.Add(1)
+	select {
+	case a.pollJobs <- pollJob{session: s, done: done, deleteResult: result, deleteLast: last}:
+	case <-r.Context().Done():
+		return
+	}
+
+	if err := <-result; err != nil {
+		apiWriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	done.Wait()
+
+	// do cleanup of the cache
+	a.mu.Lock()
+	key := sessionKey{harness: s.Harness, id: s.ID}
+	if a.sessions[folder][key] == s {
+		delete(a.sessions[folder], key)
+		if len(a.sessions[folder]) == 0 {
+			delete(a.sessions, folder)
+		}
+	}
+	a.mu.Unlock()
+	a.lastOpened.Lock()
+	delete(a.lastOpened.times[folder], s.ID)
+	a.lastOpened.Unlock()
+	apiWriteJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }

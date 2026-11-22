@@ -72,7 +72,9 @@ func (a *app) listFolderSessions(folder string) error {
 					existing.Mu.Unlock()
 					continue
 				}
-				existing.FirstUserMsg = s.FirstUserMsg
+				if s.FirstUserMsg != "" {
+					existing.FirstUserMsg = s.FirstUserMsg
+				}
 				existing.LastTimestampMs = s.LastTimestampMs
 				existing.ParentSessID = s.ParentSessID
 				existing.Mu.Unlock()
