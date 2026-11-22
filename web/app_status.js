@@ -4,11 +4,16 @@ function renderStatus(status) {
 	statusView.replaceChildren();
 	const version = document.createElement("p");
 	version.textContent = `Version: ${status.version || "unknown"}`;
-	const update = document.createElement("p");
-	update.textContent =
-		status.update ||
-		`To update, run ${status.update_command || "go install github.com/ongspxm/ahweb@latest"}.`;
+	const update = document.createElement("p"),
+		updateError = status.version === "(devel)"
+			? "Update checks are unavailable for development builds."
+			: "Could not check for updates.";
+	update.textContent = status.update ||
+		(status.update_check_failed
+			? updateError
+			: `You’re up to date: version ${status.version || "unknown"}.`);
 	statusView.append(version, update);
+	window.setNotice("update", status.update || "");
 
 	const pollStatus = document.createElement("p");
 	pollStatus.textContent = status.poll_status || "poll.session 0";

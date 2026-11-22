@@ -70,15 +70,16 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		projects = append(projects, project)
 	}
-	version, notice := checkUpdateNotice()
+	version, notice, updateCheckFailed := checkUpdateNotice()
 	apiWriteJSON(w, http.StatusOK, struct {
-		Version       string          `json:"version"`
-		Update        string          `json:"update"`
-		UpdateCommand string          `json:"update_command"`
-		PollStatus    string          `json:"poll_status"`
-		Harnesses     []statusHarness `json:"harnesses"`
-		Projects      []statusProject `json:"projects"`
-	}{Version: version, Update: notice, UpdateCommand: updateCommand, PollStatus: pollStatus, Harnesses: harnesses, Projects: projects})
+		Version           string          `json:"version"`
+		Update            string          `json:"update"`
+		UpdateCommand     string          `json:"update_command"`
+		UpdateCheckFailed bool            `json:"update_check_failed"`
+		PollStatus        string          `json:"poll_status"`
+		Harnesses         []statusHarness `json:"harnesses"`
+		Projects          []statusProject `json:"projects"`
+	}{Version: version, Update: notice, UpdateCommand: updateCommand, UpdateCheckFailed: updateCheckFailed, PollStatus: pollStatus, Harnesses: harnesses, Projects: projects})
 }
 
 const (
@@ -86,31 +87,41 @@ const (
 	updateCommand  = "go install github.com/ongspxm/ahweb@latest"
 )
 
-func checkUpdateNotice() (string, string) {
+func checkUpdateNotice() (string, string, bool) {
+	_formatNotice := func(current, latest string, err error) (string, string, bool) {
+		if current == "" {
+			current = "unknown"
+		}
+		if err != nil || !semver.IsValid(current) || !semver.IsValid(latest) {
+			return current, "", true
+		}
+		return current, formatUpdateNotice(current, latest), false
+	}
+
 	info, ok := debug.ReadBuildInfo()
 	if !ok || info.Main.Version == "" {
-		return "unknown", ""
+		return _formatNotice("unknown", "", fmt.Errorf("missing build version"))
 	}
 	current := info.Main.Version
 	if !semver.IsValid(current) {
-		return current, ""
+		return _formatNotice(current, "", fmt.Errorf("invalid build version"))
 	}
 	client := http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(updateCheckURL)
 	if err != nil {
-		return current, ""
+		return _formatNotice(current, "", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return current, ""
+		return _formatNotice(current, "", fmt.Errorf("update service returned %s", resp.Status))
 	}
 	var latest struct {
 		Version string `json:"Version"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&latest) != nil {
-		return current, ""
+	if err := json.NewDecoder(resp.Body).Decode(&latest); err != nil {
+		return _formatNotice(current, "", err)
 	}
-	return current, formatUpdateNotice(current, latest.Version)
+	return _formatNotice(current, latest.Version, nil)
 }
 
 func formatUpdateNotice(current, latest string) string {
