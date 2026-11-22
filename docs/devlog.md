@@ -14,6 +14,24 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
+
+## 2026-11-22 DONE. add webui delete specific chat sess
+add a x btn next to the each of the chat btn
+(should look like the "delete btn" in projects panel)
+it should trigger a session specific delete
+ponytail design a plan for api changes.
+
+POST /cleanup?folder=<folder>&sessid=<id> deletes only that session.
+
+## 2026-11-21 DONE. webui add btn to copy user message
+sometimes we wan to copy user msg, so that we can skip typing it all the time
+but copying it by hand is shed
+so add webui btn to copy user msg (near rewind btn)
+
+## 2026-11-19 DONE. webui update notice
+update checks used to fail silently, as `(devel)` builds could not be compared as semver.
+make api return version chk status flag and put into notice area if have updates
+
 ## 2026-11-18 DONE. codex daemon parse only stdout
 codex daemon starts with json parsing err
 dig: seems to be result of merging the stdout and stderr into CombinedOuptut()

@@ -30,7 +30,7 @@ ahweb help
 ## API
 All fields required unless marked optional.
 - `GET /host` returns normalized instance name, used for identifying server.
-- `GET /api/status` returns a bunch of server stats, including version and update notice, and also running status like harness availability.
+- `GET /api/status` returns server stats, including version, update notice, and `update_check_failed` when the update check could not complete.
 
 ### Config & models
 - `GET /api/config` returns all config as JSON; `GET /api/config?key=...` returns one value.
@@ -62,6 +62,7 @@ All fields required unless marked optional.
 - `POST /api/unqueue?folder=...&sessid=...&harness=...` clears and returns waiting `queued` text and `queued_images` without stopping the active operation.
 - `POST /api/rewind?folder=...&sessid=...&harness=...&rewind_id=...` rewinds an idle session. Returns `prompt`, `prompt_images`, and the refreshed full event history
 - `POST /cleanup?confirm=0&days=8` previews deletion of sessions older than 8 days across all worktrees. Returns `{"planid":"...","data":{"folder":N}}`. `days` is a required nonnegative integer.
+- `POST /cleanup?folder=...&sessid=...` deletes that one session. Returns `{"deleted":true}`; fails if the session is missing or cannot be deleted.
 - `POST /cleanup?confirm=1&plan=...` deletes the previewed candidates. Returns `{"data":{"folder":N}}` (plus `error` on partial failures, HTTP 207).
 - `GET /api/cli?folder=...&offset=...` is a WebSocket terminal stream. The optional byte `offset` resumes output; the server first sends a text `{"type":"offset","offset":N}` frame, then binary terminal output.
 
