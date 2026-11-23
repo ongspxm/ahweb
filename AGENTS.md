@@ -29,7 +29,7 @@
 - the ordering should be on the semantics of the action, not the keyboard shortcuts.
 - IMPT: shift doesnt really work, the way we capture the keys (eg we cant do leader + ? cos ? is shift+/)
 
-## for notice and errors
+## for notifs and errors
 - always use the notice-area for information to be highlighted to user.
 
 # gocode
@@ -50,3 +50,12 @@
 - main.go is strictly for plumping for the api only. creating connection, the paths, etc etc
 - any test written should not be testing the "small item", we should be testing in a "more integration test" style, so that the test touches more stuff
     - eg: when testing the handleXXX fns we should always aim to test at api request and response level, instead of testing the handleXXX() directly
+
+## discussing code structure using mermaid diagrams
+when discussing Adapter's code, its possible to use seq diagram
+each of the Adapter fns will be a par scope, named like "Connect()" / "CleanUp()"
+
+(we want to know how things are being updated)
+each of the "things that store data", eg conn.Events session.Events etc etc
+should exist as a participant, the arrows will show "how the data storage is altered"
+also add a user to identify triggering Adapter fns, like "Connect()"
