@@ -128,5 +128,5 @@ func formatUpdateNotice(current, latest string) string {
 	if !semver.IsValid(current) || !semver.IsValid(latest) || semver.Compare(latest, current) <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Update available: %s. Run %s to update.", latest, updateCommand)
+	return fmt.Sprintf("Update available: %s. Run this to update:   %s", latest, updateCommand)
 }
