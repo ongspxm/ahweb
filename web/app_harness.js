@@ -18,7 +18,12 @@ function _renderMermaid(source, diagram) {
 		document.getElementById(id)?.remove();
 		document.getElementById(`d${id}`)?.remove();
 		document.getElementById(`i${id}`)?.remove();
-		if (diagram.renderID === renderID) diagram.textContent = `Could not render diagram: ${err.message}`;
+		if (diagram.renderID === renderID) {
+			const pre = document.createElement("pre"), code = document.createElement("code");
+			code.textContent = `Could not render diagram: ${err.message}`;
+			pre.append(code);
+			diagram.replaceChildren(pre);
+		}
 	});
 }
 new MutationObserver(() => {
@@ -506,6 +511,7 @@ function renderEvents(list) {
 			button.addEventListener("click", async () => {
 				try {
 					await navigator.clipboard.writeText(copyText);
+					setNotice("copied", `copied: ${Array.from(copyText).slice(0, 140).join("")}…`);
 				} catch {
 					setError("Could not copy message");
 				}
@@ -829,9 +835,13 @@ function renderProjectLists() {
 		const b = row.querySelector("button");
 		b.className = `btn-item${worktree.dirname === selectedWorktree ? "" : " outline"}`;
 		b.dataset.path = path;
-		b.textContent = worktree.branch
-			? `${worktree.branch} ${_basename(path)}`
-			: worktree.dirname;
+		const label = document.createElement("span");
+		label.textContent = worktree.branch
+			? worktree.branch.replace(/^\(([^)]+)\)\s*/, "$1 ")
+			: path;
+		const basename = document.createElement("small");
+		basename.textContent = _basename(path);
+		b.replaceChildren(label, basename);
 		b.title = worktree.dirname;
 		const chats = Object.values(CACHE.chats[cachePath(worktree.dirname)] || {});
 		const busy = chats.some((chat) => chat.busy),
@@ -1049,22 +1059,24 @@ window.apiLoadModels = apiLoadModels;
 	const _run = async () => {
 		if (!preview) return;
 		previewButton.disabled = runButton.disabled = true;
+		let res;
 		try {
-			const res = await _request({}, true, preview.plan);
-			preview = null;
-			_render(res.body);
-			setError("");
-			dialog.close();
-			setNotice("cleanup", "Old sessions deleted");
-			await apiLoadProjects();
+			res = await _request({}, true, preview.plan);
 		} catch (err) {
 			preview = null;
 			if (err.counts) _render(err.counts);
 			setError(err.message);
-		} finally {
 			previewButton.disabled = false;
 			runButton.disabled = !preview?.plan;
+			return;
 		}
+		preview = null;
+		dialog.close();
+		setError("");
+		setNotice("cleanup", "Old sessions deleted");
+		_render(res.body);
+		await apiLoadProjects();
+		previewButton.disabled = false;
 	};
 	$("#cleanup-sessions").addEventListener("click", () => {
 		_reset(true);
