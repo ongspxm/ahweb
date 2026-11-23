@@ -15,6 +15,11 @@ repos:
         entry: goimports -w
         language: system
         types: [go]
+      - id: gopls
+        name: gopls
+        entry: gopls check
+        language: system
+        types: [go]
   - repo: https://github.com/biomejs/pre-commit
     rev: v2.2.4
     hooks:
