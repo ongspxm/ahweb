@@ -14,6 +14,28 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
+## 2026-11-23 DONE. webui show Mermaid render errors in a code block
+
+## 2026-11-22 DONE. webui make only the side content scrollable
+webui the .side-section shouldnt be scrollable
+the .section-content should be scrollable
+(the final goal is such that only the content is scrollable, but the summary is always shown)
+
+## 2026-11-22 TODO. webui reflect cleanup complete
+after webui finish /cleanup?confirm=1
+then close the cleanup dialog (to hint to user that the cleanup is done)
+
+## 2026-11-22 TODO. notice for copy
+webui. add notif for after copying stuff.
+after i click the "copy btn" for a particular msg
+add a notif of the form: "copied: (... 140chars from msg ...)"
+
+## 2026-11-22 TODO. webui open in new tab for mermaid
+webui. add feature to open mermaid diagram in new tab
+prob: i wanna be able to view mermaid rendered diagram
+in big view and can zoom in and out.
+
+suggest a ui for this use case.
 
 ## 2026-11-22 DONE. add webui delete specific chat sess
 add a x btn next to the each of the chat btn
