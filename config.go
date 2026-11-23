@@ -30,6 +30,8 @@ type appConfig struct {
 	CodexDefaultReasoning      string   `json:"codex_default_reasoning"`
 	CursorDefaultModel         string   `json:"cursor_default_model"`
 	CursorDefaultReasoning     string   `json:"cursor_default_reasoning"`
+	CopilotDefaultModel        string   `json:"copilot_default_model"`
+	CopilotDefaultReasoning    string   `json:"copilot_default_reasoning"`
 }
 
 func (c appConfig) validate() error {

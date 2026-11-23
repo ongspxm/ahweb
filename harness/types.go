@@ -20,7 +20,6 @@ const (
 
 type Event struct {
 	Type        EventType `json:"type"`
-	Content     string    `json:"content,omitempty"`
 	Images      []string  `json:"images,omitempty"` // data URIs
 	ToolName    string    `json:"tool_name,omitempty"`
 	ToolCallID  string    `json:"tool_call_id,omitempty"`
@@ -28,6 +27,10 @@ type Event struct {
 	TimestampMs int64     `json:"timestamp,omitempty"`
 	Model       string    `json:"model,omitempty"`
 	RewindID    string    `json:"rewind_id,omitempty"`
+
+	// in tool_start this should include the "params" that the tool is called with
+	// in tool_end this should include the "results"
+	Content string `json:"content,omitempty"`
 }
 
 type Model struct {
@@ -78,7 +81,6 @@ type Session struct {
 	ContextTokens   int64
 	ContextWindow   int64
 }
-
 
 func (s *Session) GetIsBusy() bool {
 	s.Mu.Lock()

@@ -19,6 +19,7 @@ import (
 
 	"github.com/ongspxm/ahweb/adapters/claude"
 	"github.com/ongspxm/ahweb/adapters/codex"
+	"github.com/ongspxm/ahweb/adapters/copilot"
 	"github.com/ongspxm/ahweb/adapters/cursor"
 	"github.com/ongspxm/ahweb/adapters/opencode"
 	"github.com/ongspxm/ahweb/adapters/pi"
@@ -137,7 +138,7 @@ func main() {
 		serverStartTimestampMs: time.Now().UnixMilli(),
 		hostIdentity:           hostIdentity,
 		adapters: map[string]harness.Adapter{
-			"pi": &pi.Adapter{}, "prime": &prime.Adapter{}, "opencode": &opencode.Adapter{}, "claude": &claude.Adapter{}, "codex": &codex.Adapter{}, "cursor": &cursor.Adapter{},
+			"pi": &pi.Adapter{}, "prime": &prime.Adapter{}, "opencode": &opencode.Adapter{}, "claude": &claude.Adapter{}, "codex": &codex.Adapter{}, "cursor": &cursor.Adapter{}, "copilot": &copilot.Adapter{},
 		},
 		models:              make(map[string]map[string]harness.Model),
 		unavailableAdapters: make(map[string]string),
@@ -330,6 +331,8 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"codex_default_reasoning":    func(c *appConfig, value string) error { c.CodexDefaultReasoning = value; return nil },
 		"cursor_default_model":       func(c *appConfig, value string) error { c.CursorDefaultModel = value; return nil },
 		"cursor_default_reasoning":   func(c *appConfig, value string) error { c.CursorDefaultReasoning = value; return nil },
+		"copilot_default_model":      func(c *appConfig, value string) error { c.CopilotDefaultModel = value; return nil },
+		"copilot_default_reasoning":  func(c *appConfig, value string) error { c.CopilotDefaultReasoning = value; return nil },
 	}
 	set, ok := setters[key]
 	if !ok {

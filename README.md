@@ -104,21 +104,21 @@ Run checks with `go build ./...` and `go test ./...`.
 ## Adapter feature support
 `Y` = supported, `N` = not supported, `?` = partial or best effort.
 
-| Feature | pi | prime | opencode | codex | cursor | claude |
-| --- | --- | --- | --- | --- | --- | --- |
-| Token count | Y | Y | ? | Y | Y | Y |
-| Cost | Y | Y | Y | Y | Y | Y |
-| Context usage | Y | Y | Y | Y | N | ? |
-| Reasoning levels | Y | Y | Y | Y | N | Y |
-| Send images | Y | Y | Y | Y | Y | Y |
-| Parent session IDs | Y | Y | Y | Y | N | N |
-| Tool results in saved history | Y | Y | Y | Y | ? | Y |
-| Delete | Y | ? | Y | Y | N | N |
-| Rewind | Y | N | Y | Y | N | N |
-| Full transcript thru files | N | N | N | N | Y | Y |
-| Session ctrl thru global daemon | N | Y | Y | Y | N | N |
-| Session ctrl thru isolated RPC | Y | N | N | N | N | N |
-| Session ctrl thru short-lived cmd stdout | N | N | N | N | Y | Y |
+| Feature | pi | prime | opencode | codex | cursor | claude | copilot |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Token count | Y | Y | ? | Y | Y | Y | Y |
+| Cost | Y | Y | Y | Y | Y | Y | Y |
+| Context usage | Y | Y | Y | Y | N | ? | N |
+| Reasoning levels | Y | Y | Y | Y | N | Y | Y |
+| Send images | Y | Y | Y | Y | Y | Y | Y |
+| Parent session IDs | Y | Y | Y | Y | N | N | N |
+| Tool results in saved history | Y | Y | Y | Y | ? | Y | Y |
+| Delete | Y | ? | Y | Y | N | N | N |
+| Rewind | Y | N | Y | Y | N | N | N |
+| Full transcript thru files | N | N | N | N | Y | Y | Y |
+| Session ctrl thru global daemon | N | Y | Y | Y | N | N | N |
+| Session ctrl thru isolated RPC | Y | N | N | N | N | N | N |
+| Session ctrl thru short-lived cmd stdout | N | N | N | N | Y | Y | Y |
 
 ### pi notes
 - each sess start one pi cli rpc
@@ -159,3 +159,9 @@ Run checks with `go build ./...` and `go test ./...`.
 - chats are resumed through the CLI, and saved history is read from Cursor's local `~/.cursor/projects` transcripts.
 - reading tool call from transcript doesnt return result, or success state
 - doesnt support headless rewind
+
+### copilot notes
+- few sources of info: event jsonl and sqlite3 db
+- sqlite3 db used for these use cases: list_sessions, token/cost usage, model listing
+- live polling using stdout from copilot cmd
+- delete and rewind are not supported yet.
