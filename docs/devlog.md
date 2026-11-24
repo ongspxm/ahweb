@@ -14,6 +14,39 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
+## 2026-11-23 TODO. copilot adapter, impl child session
+copliot harness, impl child session
+
+## 2026-11-24 PARK. copilot adapter rewind
+copilot CLI exposes resume/continue/session-id, but no rewind/revert/fork operation.
+do not invent a CLI invocation or delete/replay history to fake rewind.
+park this until a native Copilot session protocol is available.
+
+## 2026-11-23 DONE. webui close delete dialog
+the delete dialogue should close anyways
+regardless whether cleanup completed or not
+since err will be shown in the notice area anyways
+
+## 2026-11-24 DONE. better update cmd
+api status returns the full cmd: `go install github.com/ongspxm/ahweb@latest && ahweb install && ahweb restart`
+webui status tab shows it in a copyable pre block and a status dot when an update is available
+no update notification is displayed in the notice area
+
+## 2026-11-23 DONE. webui should refresh status regularly
+we want to make sure that update notifcation is automated.
+webui. the refresh status should run in a setTimeout every 10mins
+
+## 2026-11-23 DONE. webui do full history refresh when busy=false
+webui, sometimes the return from the api is wonky
+and the msgs is out of order / not complete
+
+as a hacky fix: in the webui session poll loop
+after we have busy=false, wait 5s
+then run a msg_from=-1 to force the full history reload
+
+this should do full history refresh after the harness is done
+and cleanup any wonky states.
+
 ## 2026-11-23 DONE. webui show Mermaid render errors in a code block
 
 ## 2026-11-22 DONE. webui make only the side content scrollable
@@ -21,16 +54,16 @@ webui the .side-section shouldnt be scrollable
 the .section-content should be scrollable
 (the final goal is such that only the content is scrollable, but the summary is always shown)
 
-## 2026-11-22 TODO. webui reflect cleanup complete
+## 2026-11-22 DONE. webui reflect cleanup complete
 after webui finish /cleanup?confirm=1
 then close the cleanup dialog (to hint to user that the cleanup is done)
 
-## 2026-11-22 TODO. notice for copy
+## 2026-11-22 DONE. notice for copy
 webui. add notif for after copying stuff.
 after i click the "copy btn" for a particular msg
 add a notif of the form: "copied: (... 140chars from msg ...)"
 
-## 2026-11-22 TODO. webui open in new tab for mermaid
+## 2026-11-22 DONE. webui open in new tab for mermaid
 webui. add feature to open mermaid diagram in new tab
 prob: i wanna be able to view mermaid rendered diagram
 in big view and can zoom in and out.
@@ -218,7 +251,7 @@ the view to be adjustable, can drag up and down to resize
 currently the panels have similar features.
 okay to use the same mechanism
 
-## 2026-11-09 TODO. rewind feature
+## 2026-11-09 DONE. rewind feature
 most harness should support the rewind feature
 (aka jump history back to a particular msg)
 to simplify implementation, on ahweb we only rewind back to "any past user msg"

@@ -27,10 +27,15 @@ ahweb help
 ## Development
 `go run .` (default port: `8321`); use `go run . -port 9090` to choose a port at startup.
 
+Run `scripts/setup-githooks.sh` for automated checks.
+
 ## API
 All fields required unless marked optional.
 - `GET /host` returns normalized instance name, used for identifying server.
-- `GET /api/status` returns server stats, including version, update notice, and `update_check_failed` when the update check could not complete.
+- `GET /api/status` returns server stats:
+  - `update`: concise newer-release notice; empty when not outdated.
+  - `update_command`: copyable full update command.
+  - `update_check_failed`: true if the check could not complete.
 
 ### Config & models
 - `GET /api/config` returns all config as JSON; `GET /api/config?key=...` returns one value.
@@ -113,7 +118,7 @@ Run checks with `go build ./...` and `go test ./...`.
 | Send images | Y | Y | Y | Y | Y | Y | Y |
 | Parent session IDs | Y | Y | Y | Y | N | N | N |
 | Tool results in saved history | Y | Y | Y | Y | ? | Y | Y |
-| Delete | Y | ? | Y | Y | N | N | N |
+| Delete | Y | ? | Y | Y | N | N | Y |
 | Rewind | Y | N | Y | Y | N | N | N |
 | Full transcript thru files | N | N | N | N | Y | Y | Y |
 | Session ctrl thru global daemon | N | Y | Y | Y | N | N | N |
@@ -164,4 +169,5 @@ Run checks with `go build ./...` and `go test ./...`.
 - few sources of info: event jsonl and sqlite3 db
 - sqlite3 db used for these use cases: list_sessions, token/cost usage, model listing
 - live polling using stdout from copilot cmd
-- delete and rewind are not supported yet.
+- delete is hacky: manual remove from db "sessions" table
+- rewind is not supported yet.
