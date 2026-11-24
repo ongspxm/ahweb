@@ -76,6 +76,7 @@
     /* Status */
     #server-status { padding: .75rem; }
     #server-status > p { margin: 0 0 .35rem; }
+    .status-update-command { max-width: 100%; margin: 0 0 .35rem; overflow-x: auto; }
     #server-status h3 { margin: .75rem 0 .35rem; }
     .status-harnesses { display: grid; gap: .15rem; }
     .status-harness-row { display: flex; align-items: center; gap: .45rem; min-height: 1.4rem; }
@@ -125,7 +126,10 @@
     .git-diff-line.added { color: var(--pico-ins-color); background: color-mix(in srgb, var(--pico-ins-color) 10%, transparent); }
     .git-diff-line.deleted { color: var(--pico-del-color); background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); }
     #messages .mermaid-code { display: flex; flex-direction: column; gap: .35rem; }
-    #messages .mermaid-toggle { align-self: flex-end; width: auto; margin: 0; padding: .2rem .5rem; font-size: 0.75rem; }
+    #messages .mermaid-actions { display: flex; justify-content: flex-end; gap: .35rem; }
+    #messages .mermaid-toggle { width: auto; margin: 0; padding: .2rem .5rem; font-size: 0.75rem; }
+    #messages .mermaid-open { width: auto; margin: 0; padding: .2rem .35rem; line-height: 1; }
+    #messages .mermaid-open svg { width: .75rem; height: .75rem; }
     #messages .mermaid-diagram { overflow-x: auto; }
     #messages .mermaid-diagram svg { max-width: 100%; }
     #tab-cli:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
@@ -199,7 +203,8 @@
     #harness { width: auto; min-width: 7rem; margin: 0; }
     #model { flex: 1; min-width: 8rem; margin: 0; }
     #reasoning { width: auto; min-width: 9rem; margin: 0; }
-    #prompt-actions { display: flex; flex: 1 0 100%; justify-content: flex-end; flex-wrap: nowrap; gap: .5rem; }
+    #prompt-actions { display: flex; flex: 1 0 100%; justify-content: flex-end; flex-wrap: wrap; gap: .5rem; }
+    #adapter-hint { flex: 0 0 100%; margin: 0; color: var(--pico-muted-color); font-size: .75rem; line-height: 1.2; text-align: right; }
     #prompt-actions button { flex: 0 0 auto; width: auto; margin: 0; }
     #add-project svg, #cleanup-sessions svg, #theme svg, #layout-toggle svg, #actions-toggle svg, #hotkey-hints-toggle svg, #actions-close svg, #prompt-actions svg { width: 1rem; height: 1rem; }
     #actions-dialog header { display: flex; justify-content: space-between; align-items: center; }
@@ -311,7 +316,7 @@
       <button type="button" data-workspace-tab="tab-files" aria-controls="tab-files" aria-selected="false">Files</button>
       <button type="button" data-workspace-tab="tab-git" aria-controls="tab-git" aria-selected="false">Git</button>
       <button type="button" data-workspace-tab="tab-cli" aria-controls="tab-cli" aria-selected="false">CLI <span id="cli-status" class="status" role="img" aria-label="CLI connected" hidden></span></button>
-      <button type="button" data-workspace-tab="tab-status" aria-controls="tab-status" aria-selected="false">Status</button>
+      <button type="button" data-workspace-tab="tab-status" aria-controls="tab-status" aria-selected="false">Status <span id="status-update" class="status" role="img" aria-label="Update available" hidden></span></button>
       <button id="workspace-refresh" type="button" aria-label="Refresh workspace" title="Refresh workspace"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
     </nav>
     <div id="tab-files" class="workspace-pane" role="tabpanel" aria-label="Files" hidden>
@@ -383,6 +388,7 @@
           <select id="reasoning" aria-label="Reasoning level" disabled></select>
           <div id="prompt-actions">
             <input id="prompt-images" type="file" accept="image/*" multiple>
+            <small id="adapter-hint">if adapter seems to be stuck, just spam refresh to help clean the state</small>
             <button id="add-image" class="secondary" type="button" aria-label="Add images" title="Add images"><i data-lucide="image-plus"></i></button>
             <button id="send" type="submit" aria-label="Send" title="Send"><i data-lucide="send"></i></button>
             <button id="refresh" class="secondary" type="button" aria-label="Refresh" title="Refresh"><i data-lucide="refresh-cw"></i></button>

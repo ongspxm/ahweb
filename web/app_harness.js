@@ -7,31 +7,82 @@
 import { gfm, gfmHtml, micromark } from "/lib/markdown/markdown.js";
 
 // mermaid utils
-window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true, theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default" });
+window.mermaid.initialize({
+	startOnLoad: false,
+	securityLevel: "strict",
+	suppressErrorRendering: true,
+	theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+});
 let mermaidID = 0;
 function _renderMermaid(source, diagram) {
-	const theme = document.documentElement.dataset.theme === "dark" ? "dark" : "default", renderID = diagram.renderID = (diagram.renderID || 0) + 1, id = `ahweb-mermaid-${++mermaidID}`;
-	window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true, theme });
-	window.mermaid.render(id, source).then(({ svg }) => {
-		if (diagram.renderID === renderID) diagram.innerHTML = svg;
-	}).catch((err) => {
-		document.getElementById(id)?.remove();
-		document.getElementById(`d${id}`)?.remove();
-		document.getElementById(`i${id}`)?.remove();
-		if (diagram.renderID === renderID) {
-			const pre = document.createElement("pre"), code = document.createElement("code");
-			code.textContent = `Could not render diagram: ${err.message}`;
-			pre.append(code);
-			diagram.replaceChildren(pre);
-		}
+	const theme =
+			document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+		renderID = (diagram.renderID || 0) + 1,
+		id = `ahweb-mermaid-${++mermaidID}`;
+	diagram.renderID = renderID;
+	window.mermaid.initialize({
+		startOnLoad: false,
+		securityLevel: "strict",
+		suppressErrorRendering: true,
+		theme,
+	});
+	const promise = window.mermaid
+		.render(id, source)
+		.then(({ svg }) => {
+			if (diagram.renderID === renderID) diagram.innerHTML = svg;
+			return svg;
+		})
+		.catch((err) => {
+			document.getElementById(id)?.remove();
+			document.getElementById(`d${id}`)?.remove();
+			document.getElementById(`i${id}`)?.remove();
+			if (diagram.renderID === renderID) {
+				const pre = document.createElement("pre"),
+					code = document.createElement("code");
+				code.textContent = `Could not render diagram: ${err.message}`;
+				pre.append(code);
+				diagram.replaceChildren(pre);
+			}
+			return null;
+		});
+	diagram.renderPromise = promise;
+	return promise;
+}
+function _openMermaidTab(source, diagram) {
+	const tab = window.open("about:blank", "_blank");
+	if (!tab) return;
+	tab.document.title = "Mermaid diagram";
+	tab.document.body.textContent = "Rendering diagram...";
+	const promise = diagram.renderPromise || _renderMermaid(source, diagram);
+	promise.then((svg) => {
+		if (!svg || tab.closed) return tab.closed ? undefined : tab.close();
+		const dark = document.documentElement.dataset.theme === "dark";
+		const svgDoc = new DOMParser().parseFromString(svg, "image/svg+xml"),
+			root = svgDoc.documentElement;
+		root.removeAttribute("width");
+		root.removeAttribute("height");
+		root.style.removeProperty("max-width");
+		root.style.removeProperty("min-width");
+		root.style.removeProperty("height");
+		root.style.width = "100%";
+		root.style.height = "auto";
+		const scalableSVG = new XMLSerializer().serializeToString(root);
+		const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mermaid diagram</title><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{font-family:system-ui,sans-serif;background:${dark ? "#11191f" : "#fff"};color:${dark ? "#cfd9e2" : "#111"}}#toolbar{position:fixed;z-index:1;display:flex;align-items:center;gap:.35rem;height:2.75rem;padding:.35rem .5rem;border-bottom:1px solid ${dark ? "#2d3a42" : "#ddd"};background:${dark ? "#11191f" : "#fff"}}#toolbar button{height:2rem;margin:0;padding:.25rem .6rem;width:auto;font:inherit;cursor:pointer}#toolbar button:disabled{cursor-not-allowed;opacity:.5}#status{min-width:3.5rem;font-size:.75rem;text-align:center}#stage{width:100%;height:100%;padding:3.35rem 1rem 1rem;overflow:auto;background:${dark ? "#11191f" : "#fff"}}#diagram{width:100%;min-height:100%}#diagram svg{display:block;width:100%;max-width:none;height:auto;margin:auto}</style></head><body><div id="toolbar"><button id="out" type="button" aria-label="Zoom out" title="Zoom out">−</button><button id="in" type="button" aria-label="Zoom in" title="Zoom in">+</button><button id="reset" type="button" aria-label="Reset zoom" title="Reset zoom">Reset</button><span id="status">100%</span></div><div id="stage"><div id="diagram">${scalableSVG}</div></div>		<script>let zoom=100;const diagram=document.getElementById("diagram"),status=document.getElementById("status"),out=document.getElementById("out"),inBtn=document.getElementById("in");function setZoom(next){zoom=Math.max(10,Math.min(500,next));diagram.style.width=zoom+"%";status.textContent=zoom+"%";out.disabled=zoom===10;inBtn.disabled=zoom===500}inBtn.onclick=()=>setZoom(zoom+10);out.onclick=()=>setZoom(zoom-10);document.getElementById("reset").onclick=()=>setZoom(100);window.addEventListener("load",()=>{try{URL.revokeObjectURL(location.href)}catch{}});setZoom(100);</script></body></html>`;
+		const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+		tab.location.replace(url);
 	});
 }
 new MutationObserver(() => {
 	document.querySelectorAll("#messages .mermaid-code").forEach((wrapper) => {
-		const code = wrapper.querySelector("code.language-mermaid"), diagram = wrapper.querySelector(".mermaid-diagram");
-		if (code && diagram && !diagram.hidden) _renderMermaid(code.textContent, diagram);
+		const code = wrapper.querySelector("code.language-mermaid"),
+			diagram = wrapper.querySelector(".mermaid-diagram");
+		if (code && diagram && !diagram.hidden)
+			_renderMermaid(code.textContent, diagram);
 	});
-}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+}).observe(document.documentElement, {
+	attributes: true,
+	attributeFilter: ["data-theme"],
+});
 
 // actual utils
 const $ = (s) => document.querySelector(s);
@@ -192,7 +243,8 @@ function nextEventSeq(events) {
 function reconcileChildren(parent, desired) {
 	for (let i = 0; i < desired.length; i++) {
 		const current = parent.childNodes[i];
-		if (current !== desired[i]) parent.insertBefore(desired[i], current || null);
+		if (current !== desired[i])
+			parent.insertBefore(desired[i], current || null);
 	}
 	while (parent.childNodes.length > desired.length) parent.lastChild.remove();
 }
@@ -225,6 +277,8 @@ function startPollSess(f, id) {
 	if (Object.hasOwn(sessions, id)) return;
 
 	const _doPoll = async () => {
+		if (!Object.hasOwn(sessions, id)) return;
+		const wasBusy = chatInfo(f, id)?.busy === true;
 		try {
 			const chat = chatInfo(f, id);
 			const start = nextEventSeq(chat?.events || []);
@@ -235,7 +289,31 @@ function startPollSess(f, id) {
 			if (!response.ok)
 				throw new Error(`events request failed: ${response.status}`);
 			const body = await response.json();
+			if (!Object.hasOwn(sessions, id)) return;
 			const updated = updateChat(f, { ...body, sessid: id });
+			if (wasBusy && !updated.busy) {
+				setTimeout(async () => {
+					const harness = chatInfo(f, id)?.harness || "pi";
+					const response = await fetch(
+						`/api/events?folder=${enc(f)}&sessid=${enc(id)}&harness=${enc(harness)}&start_from=-1&opened=${f === cachePath(folder) && id === sessid ? 1 : 0}`,
+					);
+					if (!response.ok) return;
+					const body = await response.json();
+					const updated = updateChat(f, {
+						...body,
+						sessid: id,
+						resetEvents: true,
+					});
+					if (f === cachePath(folder) && id === sessid) {
+						renderReset();
+						renderEvents(body.events || []);
+						renderBusy(updated.busy);
+						renderQueuedPrompts(updated.queued, updated.queued_images || []);
+						renderStats(updated.stats);
+					}
+					if (updated.busy || updated.queued) startPollSess(f, id);
+				}, 5000);
+			}
 			if (f === cachePath(folder) && id === sessid) {
 				renderBusy(updated.busy);
 				renderEvents(body.events || []);
@@ -377,13 +455,19 @@ function renderSessList(f) {
 			remove.addEventListener("click", async () => {
 				if (!confirm(`Permanently delete this chat?\n\n${s.sessid}`)) return;
 				try {
-					const r = await fetch(`/cleanup?folder=${enc(folder)}&sessid=${enc(s.sessid)}`, { method: "POST" }),
+					const r = await fetch(
+							`/cleanup?folder=${enc(folder)}&sessid=${enc(s.sessid)}`,
+							{ method: "POST" },
+						),
 						body = await r.json();
 					if (!r.ok) throw new Error(body.error || "Could not delete chat");
+					stopPollSess(folder, s.sessid);
 					delete CACHE.chats[path][s.sessid];
 					if (sessid === s.sessid) apiLoadSess(folder, null);
 					renderSessList(folder);
-				} catch (err) { setError(err.message); }
+				} catch (err) {
+					setError(err.message);
+				}
 			});
 			row.append(b, remove);
 			cards.set(s.sessid, row);
@@ -490,7 +574,9 @@ function renderEvents(list) {
 						: "assistant",
 		);
 		if (role === "THINKING") a.classList.add("thinking");
-		const h = document.createElement(role === "THINKING" ? "summary" : "header");
+		const h = document.createElement(
+			role === "THINKING" ? "summary" : "header",
+		);
 		h.className = "row";
 		const label = document.createElement("div");
 		const strong = document.createElement("strong");
@@ -511,7 +597,10 @@ function renderEvents(list) {
 			button.addEventListener("click", async () => {
 				try {
 					await navigator.clipboard.writeText(copyText);
-					setNotice("copied", `copied: ${Array.from(copyText).slice(0, 140).join("")}…`);
+					setNotice(
+						"copied",
+						`copied: ${Array.from(copyText).slice(0, 140).join("")}…`,
+					);
 				} catch {
 					setError("Could not copy message");
 				}
@@ -688,33 +777,45 @@ function renderEvents(list) {
 				htmlExtensions: [gfmHtml()],
 			});
 
-            // rendering mermaid only for assistant msg
+			// rendering mermaid only for assistant msg
 			b.querySelectorAll("pre > code.language-mermaid").forEach((code) => {
-				const pre = code.parentElement, wrapper = document.createElement("div"), toggle = document.createElement("button"), diagram = document.createElement("div");
+				const pre = code.parentElement,
+					wrapper = document.createElement("div"),
+					actions = document.createElement("div"),
+					toggle = document.createElement("button"),
+					open = document.createElement("button"),
+					diagram = document.createElement("div");
 				wrapper.className = "mermaid-code";
+				actions.className = "mermaid-actions";
 				toggle.className = "outline secondary mermaid-toggle";
 				toggle.type = "button";
 				toggle.textContent = "Diagram";
+				open.className = "outline secondary mermaid-open";
+				open.type = "button";
+				open.title = "Open in new tab";
+				open.setAttribute("aria-label", open.title);
+				open.innerHTML = '<i data-lucide="external-link"></i>';
 				diagram.className = "mermaid-diagram";
 				diagram.hidden = true;
-				let rendered = false;
 				toggle.addEventListener("click", () => {
 					if (!pre.hidden) {
 						pre.hidden = true;
 						diagram.hidden = false;
 						toggle.textContent = "Text";
-						if (!rendered) {
+						if (!diagram.renderPromise)
 							_renderMermaid(code.textContent, diagram);
-							rendered = true;
-						}
 					} else {
 						pre.hidden = false;
 						diagram.hidden = true;
 						toggle.textContent = "Diagram";
 					}
 				});
+				open.addEventListener("click", () =>
+					_openMermaidTab(code.textContent, diagram),
+				);
 				pre.replaceWith(wrapper);
-				wrapper.append(toggle, pre, diagram);
+				actions.append(open, toggle);
+				wrapper.append(actions, pre, diagram);
 			});
 			_images(b, e);
 		} else if (e.type === "tool_start") _toolStart(e);
@@ -787,8 +888,8 @@ function renderProjectLists() {
 					return;
 				try {
 					const r = await fetch(`/api/delproject?folder=${enc(path)}`, {
-						method: "POST",
-					}),
+							method: "POST",
+						}),
 						body = await r.json();
 					if (!r.ok) throw new Error(body.error || "Could not remove project");
 					setError("");
@@ -819,7 +920,8 @@ function renderProjectLists() {
 			row,
 		]),
 	);
-	const _basename = (path) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+	const _basename = (path) =>
+		path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 	const worktreeRows = [];
 	for (const worktree of worktreePaths) {
 		const path = worktree.dirname;
@@ -847,8 +949,7 @@ function renderProjectLists() {
 		const busy = chats.some((chat) => chat.busy),
 			pending = chats.some(
 				(chat) =>
-					!chat.parent_sessid &&
-					Number(chat.tstamp) > Number(chat.last_opened),
+					!chat.parent_sessid && Number(chat.tstamp) > Number(chat.last_opened),
 			);
 		if (busy || pending) {
 			let status = row.querySelector(":scope > .status");
@@ -866,8 +967,12 @@ function renderProjectLists() {
 		worktreeRows.push(emptyText(eleWorktrees, "No worktrees"));
 	}
 	reconcileChildren(eleWorktrees, worktreeRows);
-	eleBreadcrumbProject.textContent = selectedProject ? _basename(selectedProject) : "(empty)";
-	const selected = worktreePaths.find((worktree) => worktree.dirname === selectedWorktree);
+	eleBreadcrumbProject.textContent = selectedProject
+		? _basename(selectedProject)
+		: "(empty)";
+	const selected = worktreePaths.find(
+		(worktree) => worktree.dirname === selectedWorktree,
+	);
 	eleBreadcrumbWorktree.textContent = selectedWorktree
 		? selected?.branch || _basename(selectedWorktree)
 		: "(empty)";
@@ -883,10 +988,16 @@ async function apiRewind(rewindID, button) {
 		icon = button.innerHTML;
 	stopPollSess(f, id);
 	button.disabled = true;
-	button.innerHTML = '<i data-lucide="loader-circle" aria-label="Rewinding"></i>';
+	button.innerHTML =
+		'<i data-lucide="loader-circle" aria-label="Rewinding"></i>';
 	if (window.lucide) window.lucide.createIcons();
 	try {
-		const params = new URLSearchParams({ folder: f, sessid: id, harness, rewind_id: rewindID });
+		const params = new URLSearchParams({
+			folder: f,
+			sessid: id,
+			harness,
+			rewind_id: rewindID,
+		});
 		const r = await fetch(`/api/rewind?${params}`, { method: "POST" });
 		const b = await r.json();
 		if (!r.ok) throw new Error(b.error || "Could not rewind");
@@ -900,7 +1011,9 @@ async function apiRewind(rewindID, button) {
 			renderStats(chat.stats);
 			elePrompt.value = b.prompt || "";
 			promptImages = (b.prompt_images || [])
-				.filter((uri) => typeof uri === "string" && uri.startsWith("data:image/"))
+				.filter(
+					(uri) => typeof uri === "string" && uri.startsWith("data:image/"),
+				)
 				.map((uri, i) => ({ file: { name: `Image ${i + 1}` }, uri }));
 			renderPromptImages();
 			growPrompt();
@@ -1059,24 +1172,25 @@ window.apiLoadModels = apiLoadModels;
 	const _run = async () => {
 		if (!preview) return;
 		previewButton.disabled = runButton.disabled = true;
-		let res;
 		try {
-			res = await _request({}, true, preview.plan);
+			const res = await _request({}, true, preview.plan);
+			preview = null;
+			dialog.close();
+			setError("");
+			setNotice("cleanup", "Old sessions deleted");
+			_render(res.body);
+			await apiLoadProjects();
+			previewButton.disabled = false;
+			runButton.disabled = true;
 		} catch (err) {
 			preview = null;
 			if (err.counts) _render(err.counts);
+			setNotice("cleanup", "");
 			setError(err.message);
+			dialog.close();
 			previewButton.disabled = false;
-			runButton.disabled = !preview?.plan;
-			return;
+			runButton.disabled = true;
 		}
-		preview = null;
-		dialog.close();
-		setError("");
-		setNotice("cleanup", "Old sessions deleted");
-		_render(res.body);
-		await apiLoadProjects();
-		previewButton.disabled = false;
 	};
 	$("#cleanup-sessions").addEventListener("click", () => {
 		_reset(true);
@@ -1401,7 +1515,9 @@ for (const [crumb, section] of [
 ])
 	crumb.addEventListener("click", () => {
 		location.hash = "#sess";
-		sideSections.forEach((item) => (item.open = item === section));
+		sideSections.forEach((item) => {
+			item.open = item === section;
+		});
 	});
 eleRefresh.addEventListener("click", () => {
 	if (!sessid) return;
@@ -1446,7 +1562,10 @@ eleHarness.addEventListener("change", renderHarnessDetails);
 async function addPromptImages(files) {
 	for (const file of files) {
 		if (typeof file === "string" && file.startsWith("data:image/")) {
-			promptImages.push({ file: { name: `Image ${promptImages.length + 1}` }, uri: file });
+			promptImages.push({
+				file: { name: `Image ${promptImages.length + 1}` },
+				uri: file,
+			});
 			continue;
 		}
 		if (!file?.type.startsWith("image/")) continue;
@@ -1487,7 +1606,6 @@ function renderPromptImages() {
 	});
 	eleImagePreview.hidden = promptImages.length === 0;
 }
-
 
 eleImageInput.addEventListener("change", async () => {
 	await addPromptImages(eleImageInput.files || []);
