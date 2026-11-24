@@ -1,22 +1,34 @@
 const statusView = document.querySelector("#server-status");
+const statusUpdate = document.querySelector("#status-update");
+const STATUS_REFRESH_INTERVAL = 600_000;
+let statusRefreshTimer = null;
 
 function renderStatus(status) {
 	statusView.replaceChildren();
 	const version = document.createElement("p");
 	version.textContent = `Version: ${status.version || "unknown"}`;
 	const update = document.createElement("p"),
-		updateError = status.version === "(devel)"
-			? "Update checks are unavailable for development builds."
-			: "Could not check for updates.";
-	update.textContent = status.update ||
+		updateError =
+			status.version === "(devel)"
+				? "Update checks are unavailable for development builds."
+				: "Could not check for updates.";
+	update.textContent =
+		status.update ||
 		(status.update_check_failed
 			? updateError
 			: `You’re up to date: version ${status.version || "unknown"}.`);
+	statusUpdate.hidden = !status.update;
 	statusView.append(version, update);
-	window.setNotice("update", status.update || "");
+	if (status.update && status.update_command) {
+		const command = document.createElement("pre");
+		command.className = "status-update-command";
+		command.textContent = status.update_command;
+		statusView.append(command);
+	}
 
 	const pollStatus = document.createElement("p");
 	pollStatus.textContent = status.poll_status || "poll.session 0";
+	statusView.append(pollStatus);
 
 	const harnesses = document.createElement("section"),
 		harnessTitle = document.createElement("h3"),
@@ -51,7 +63,6 @@ function renderStatus(status) {
 	}
 	harnesses.append(harnessTitle, harnessRows);
 	statusView.append(harnesses);
-	statusView.append(pollStatus);
 
 	const projects = document.createElement("section"),
 		projectsTitle = document.createElement("h3"),
@@ -135,9 +146,14 @@ function renderStatus(status) {
 
 window.addEventListener("server-status", (event) => renderStatus(event.detail));
 window.addEventListener("server-status-error", (event) => {
+	statusUpdate.hidden = true;
 	statusView.textContent = event.detail || "Could not load server status";
 });
 async function apiLoadStatus() {
+	if (statusRefreshTimer !== null) {
+		window.clearTimeout(statusRefreshTimer);
+		statusRefreshTimer = null;
+	}
 	try {
 		const response = await fetch("/api/status");
 		if (!response.ok) throw new Error("Could not load server status");
@@ -148,6 +164,14 @@ async function apiLoadStatus() {
 		window.dispatchEvent(
 			new CustomEvent("server-status-error", { detail: err.message }),
 		);
+	} finally {
+		if (statusRefreshTimer !== null) {
+			window.clearTimeout(statusRefreshTimer);
+		}
+		statusRefreshTimer = window.setTimeout(() => {
+			statusRefreshTimer = null;
+			apiLoadStatus();
+		}, STATUS_REFRESH_INTERVAL);
 	}
 }
 window.apiLoadStatus = apiLoadStatus;

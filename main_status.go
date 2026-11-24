@@ -84,7 +84,7 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 const (
 	updateCheckURL = "https://proxy.golang.org/github.com/ongspxm/ahweb/@latest"
-	updateCommand  = "go install github.com/ongspxm/ahweb@latest"
+	updateCommand  = "go install github.com/ongspxm/ahweb@latest && ahweb install && ahweb restart"
 )
 
 func checkUpdateNotice() (string, string, bool) {
@@ -128,5 +128,5 @@ func formatUpdateNotice(current, latest string) string {
 	if !semver.IsValid(current) || !semver.IsValid(latest) || semver.Compare(latest, current) <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Update available: %s. Run this to update:   %s", latest, updateCommand)
+	return fmt.Sprintf("Update available: %s.", latest)
 }
