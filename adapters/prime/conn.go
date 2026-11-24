@@ -105,7 +105,7 @@ func (c *connCmd) Ready() error {
 	return err
 }
 
-func (c *connCmd) call(primeID, command string, params map[string]any, data any) error {
+func (c *connCmd) call(harnessID, command string, params map[string]any, data any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.socket == nil {
@@ -120,8 +120,8 @@ func (c *connCmd) call(primeID, command string, params map[string]any, data any)
 	for key, value := range params {
 		body[key] = value
 	}
-	if primeID != "" {
-		body["activeSessionId"] = primeID
+	if harnessID != "" {
+		body["activeSessionId"] = harnessID
 	}
 	envelope := map[string]any{
 		"type": "command", "id": id,
@@ -210,8 +210,8 @@ func (e *connEvt) Ready() error {
 				e.mu.Lock()
 				if e.socket == sock {
 					e.socket = nil
-					for primeID := range e.subs {
-						e.needsFull[primeID] = true
+					for harnessID := range e.subs {
+						e.needsFull[harnessID] = true
 					}
 					e.subs = make(map[string]bool)
 					e.retryAt = time.Now().Add(5 * time.Second)
@@ -246,16 +246,16 @@ func (e *connEvt) Ready() error {
 					e.mu.Unlock()
 					continue
 				}
-				var primeID string
-				_ = json.Unmarshal(frame["activeSessionId"], &primeID)
-				if primeID == "" {
+				var harnessID string
+				_ = json.Unmarshal(frame["activeSessionId"], &harnessID)
+				if harnessID == "" {
 					continue
 				}
 				if kind != "session_event" {
 					switch kind {
 					case "session_replaced", "session_resynced", "session_closed", "session_snapshot_begin", "session_snapshot_chunk", "session_snapshot_end", "session_snapshot_failed":
 						e.mu.Lock()
-						e.needsFull[primeID] = true
+						e.needsFull[harnessID] = true
 						e.mu.Unlock()
 					}
 					continue
@@ -265,13 +265,13 @@ func (e *connEvt) Ready() error {
 					continue
 				}
 				e.mu.Lock()
-				events := e.events[primeID]
+				events := e.events[harnessID]
 				if len(events) >= 256 {
 					copy(events, events[1:])
 					events = events[:255]
-					e.needsFull[primeID] = true
+					e.needsFull[harnessID] = true
 				}
-				e.events[primeID] = append(events, raw)
+				e.events[harnessID] = append(events, raw)
 				e.mu.Unlock()
 			}
 		}()
@@ -279,22 +279,22 @@ func (e *connEvt) Ready() error {
 	return err
 }
 
-func (e *connEvt) isSub(primeID string) bool {
+func (e *connEvt) isSub(harnessID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.subs[primeID]
+	return e.subs[harnessID]
 }
 
 func sub(c *SessionConn) error {
-	if c.ActiveSessionID == "" {
+	if c.HarnessID == "" {
 		return nil
 	}
 	if err := connEvt0.Ready(); err != nil {
 		return err
 	}
-	e, primeID := &connEvt0, c.ActiveSessionID
+	e, harnessID := &connEvt0, c.HarnessID
 	e.mu.Lock()
-	if e.subs[primeID] {
+	if e.subs[harnessID] {
 		e.mu.Unlock()
 		return nil
 	}
@@ -309,13 +309,13 @@ func sub(c *SessionConn) error {
 	sock := e.socket
 	respChan := make(chan evtReply, 1)
 	e.replyChans[id] = respChan
-	clientID := fmt.Sprintf("%s-events-%s", daemonClientID, primeID)
+	clientID := fmt.Sprintf("%s-events-%s", daemonClientID, harnessID)
 	envelope := map[string]any{
 		"type": "command", "id": id,
 		"protocol": map[string]any{"name": daemonProtocolName, "version": daemonProtocolVersion},
 		"clientId": daemonClientID + "-events",
 		"command": map[string]any{
-			"type": "attach", "id": id, "activeSessionId": primeID,
+			"type": "attach", "id": id, "activeSessionId": harnessID,
 			"clientId": clientID, "capabilities": []string{"event_sequence"},
 		},
 	}
@@ -350,21 +350,21 @@ func sub(c *SessionConn) error {
 	}
 
 	// setting up all the state
-	e.subs[primeID] = true
+	e.subs[harnessID] = true
 	return nil
 }
 
 func unsub(c *SessionConn) {
 	// param chks + early exit
-	if c == nil || c.ActiveSessionID == "" {
+	if c == nil || c.HarnessID == "" {
 		return
 	}
-	e, primeID := &connEvt0, c.ActiveSessionID
+	e, harnessID := &connEvt0, c.HarnessID
 	e.mu.Lock()
-	if e.socket == nil || !e.subs[primeID] {
-		delete(e.subs, primeID)
-		delete(e.events, primeID)
-		delete(e.needsFull, primeID)
+	if e.socket == nil || !e.subs[harnessID] {
+		delete(e.subs, harnessID)
+		delete(e.events, harnessID)
+		delete(e.needsFull, harnessID)
 		e.mu.Unlock()
 		return
 	}
@@ -379,7 +379,7 @@ func unsub(c *SessionConn) {
 		"type": "command", "id": id,
 		"protocol": map[string]any{"name": daemonProtocolName, "version": daemonProtocolVersion},
 		"clientId": daemonClientID + "-events",
-		"command":  map[string]any{"type": "detach", "id": id, "activeSessionId": primeID},
+		"command":  map[string]any{"type": "detach", "id": id, "activeSessionId": harnessID},
 	}
 	err := json.NewEncoder(sock).Encode(envelope)
 	e.mu.Unlock()
@@ -394,38 +394,38 @@ func unsub(c *SessionConn) {
 	e.mu.Lock()
 	delete(e.replyChans, id)
 	if e.socket == sock {
-		delete(e.subs, primeID)
-		delete(e.events, primeID)
-		delete(e.needsFull, primeID)
+		delete(e.subs, harnessID)
+		delete(e.events, harnessID)
+		delete(e.needsFull, harnessID)
 	}
 	e.mu.Unlock()
 }
 
-func (e *connEvt) drainSub(primeID string) ([]json.RawMessage, bool) {
+func (e *connEvt) drainSub(harnessID string) ([]json.RawMessage, bool) {
 	// process events from the stream
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	events := e.events[primeID]
-	needsFull := e.needsFull[primeID]
-	delete(e.events, primeID)
-	delete(e.needsFull, primeID)
+	events := e.events[harnessID]
+	needsFull := e.needsFull[harnessID]
+	delete(e.events, harnessID)
+	delete(e.needsFull, harnessID)
 	return events, needsFull
 }
 
-func (e *connEvt) undrainSub(primeID string, events []json.RawMessage, needsFull bool) {
+func (e *connEvt) undrainSub(harnessID string, events []json.RawMessage, needsFull bool) {
 	// put the events back, because processing failed.
 	if len(events) == 0 && !needsFull {
 		return
 	}
 	e.mu.Lock()
-	queued := append(events, e.events[primeID]...)
+	queued := append(events, e.events[harnessID]...)
 	if len(queued) > 256 {
 		queued = queued[len(queued)-256:]
-		e.needsFull[primeID] = true
+		e.needsFull[harnessID] = true
 	}
-	e.events[primeID] = queued
+	e.events[harnessID] = queued
 	if needsFull {
-		e.needsFull[primeID] = true
+		e.needsFull[harnessID] = true
 	}
 	e.mu.Unlock()
 }

@@ -19,10 +19,10 @@ import (
 )
 
 var (
-	cacheMu       sync.Mutex
-	toOpencodeIDs = make(map[string]string)
-	toLocalIDs    = make(map[string]string)
-	cache         = make(map[string]map[string]*Conn)
+	cacheMu           sync.Mutex
+	sessIDToHarnessID = make(map[string]map[string]string)
+	harnessIDToSessID = make(map[string]map[string]string)
+	cache             = make(map[string]map[string]*Conn)
 
 	serviceMu  sync.Mutex
 	serviceURL string
@@ -94,15 +94,15 @@ func (*Adapter) Ready() error {
 }
 
 type Conn struct {
-	OpencodeID  string
+	HarnessID   string
 	LastUpdated int64
 	Fetched     bool
 	session     *harness.Session
 }
 
 func (c *Conn) call(method, path string, query url.Values, body any, result any) error {
-	if c.OpencodeID != "" {
-		path = "/api/session/" + url.PathEscape(c.OpencodeID) + path
+	if c.HarnessID != "" {
+		path = "/api/session/" + url.PathEscape(c.HarnessID) + path
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := (&Adapter{}).Ready(); err != nil {
@@ -233,7 +233,7 @@ func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error)
 						Next *string `json:"next"`
 					} `json:"cursor"`
 				}
-				if err := (&Conn{OpencodeID: item.ID}).call(http.MethodGet, "/message", q, nil, &history); err != nil {
+				if err := (&Conn{HarnessID: item.ID}).call(http.MethodGet, "/message", q, nil, &history); err != nil {
 					return nil, err
 				}
 				for _, message := range history.Data {
@@ -254,13 +254,13 @@ func (a *Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error)
 			}
 			id := item.ID
 			cacheMu.Lock()
-			if local := toLocalIDs[id]; local != "" {
+			if local := harnessIDToSessID[realFolder][id]; local != "" {
 				id = local
 			}
 			cacheMu.Unlock()
 			parentID := item.ParentID
 			cacheMu.Lock()
-			if local := toLocalIDs[parentID]; local != "" {
+			if local := harnessIDToSessID[realFolder][parentID]; local != "" {
 				parentID = local
 			}
 			cacheMu.Unlock()
@@ -289,17 +289,27 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 		return nil
 	}
 	cacheMu.Unlock()
-	OpencodeID := ""
+	HarnessID := ""
 	if strings.HasPrefix(s.ID, "ses") {
-		OpencodeID = s.ID
+		HarnessID = s.ID
+		cacheMu.Lock()
+		if sessIDToHarnessID[s.RealPath] == nil {
+			sessIDToHarnessID[s.RealPath] = make(map[string]string)
+		}
+		if harnessIDToSessID[s.RealPath] == nil {
+			harnessIDToSessID[s.RealPath] = make(map[string]string)
+		}
+		sessIDToHarnessID[s.RealPath][s.ID] = HarnessID
+		harnessIDToSessID[s.RealPath][HarnessID] = s.ID
+		cacheMu.Unlock()
 	} else {
 		cacheMu.Lock()
-		OpencodeID = toOpencodeIDs[s.ID]
+		HarnessID = sessIDToHarnessID[s.RealPath][s.ID]
 		cacheMu.Unlock()
 	}
 
-	// for new sess, create OpencodeID and save mapping
-	if OpencodeID == "" {
+	// for new sess, create HarnessID and save mapping
+	if HarnessID == "" {
 		body := map[string]any{"location": map[string]string{"directory": s.RealPath}}
 		s.Mu.Lock()
 		model, reasoning := s.PromptModel, s.PromptReasoning
@@ -323,17 +333,23 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 		if err := (&Conn{}).call(http.MethodPost, "/api/session", nil, body, &created); err != nil {
 			return err
 		}
-		OpencodeID = created.Data.ID
-		if OpencodeID == "" {
+		HarnessID = created.Data.ID
+		if HarnessID == "" {
 			return errors.New("opencode returned no session ID")
 		}
 		cacheMu.Lock()
-		toOpencodeIDs[s.ID] = OpencodeID
-		toLocalIDs[OpencodeID] = s.ID
+		if sessIDToHarnessID[s.RealPath] == nil {
+			sessIDToHarnessID[s.RealPath] = make(map[string]string)
+		}
+		if harnessIDToSessID[s.RealPath] == nil {
+			harnessIDToSessID[s.RealPath] = make(map[string]string)
+		}
+		sessIDToHarnessID[s.RealPath][s.ID] = HarnessID
+		harnessIDToSessID[s.RealPath][HarnessID] = s.ID
 		cacheMu.Unlock()
 	}
 
-	conn = &Conn{OpencodeID: OpencodeID, session: s}
+	conn = &Conn{HarnessID: HarnessID, session: s}
 	cacheMu.Lock()
 	if cache[s.RealPath] == nil {
 		cache[s.RealPath] = make(map[string]*Conn)
@@ -364,12 +380,12 @@ func (a *Adapter) Delete(s *harness.Session) error {
 		return errors.New("cannot delete a busy OpenCode session")
 	}
 	cacheMu.Lock()
-	id := toOpencodeIDs[s.ID]
+	id := sessIDToHarnessID[s.RealPath][s.ID]
 	cacheMu.Unlock()
 	if id == "" {
 		id = s.ID
 	}
-	conn := &Conn{OpencodeID: id}
+	conn := &Conn{HarnessID: id}
 	if err := conn.call("DELETE", "", nil, nil, nil); err != nil {
 		return err
 	}
@@ -377,8 +393,8 @@ func (a *Adapter) Delete(s *harness.Session) error {
 		return err
 	}
 	cacheMu.Lock()
-	delete(toOpencodeIDs, s.ID)
-	delete(toLocalIDs, id)
+	delete(sessIDToHarnessID[s.RealPath], s.ID)
+	delete(harnessIDToSessID[s.RealPath], id)
 	cacheMu.Unlock()
 	return nil
 }
@@ -499,7 +515,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 
 	// partial polling -- processing SSE msgs only
 	if !full {
-		sseMessages, usages, pending := processSSECache(conn.OpencodeID, false)
+		sseMessages, usages, pending := processSSECache(conn.HarnessID, false)
 		for _, usage := range usages {
 			s.Mu.Lock()
 			s.FullInputToken += usage.Tokens.Input
@@ -545,9 +561,9 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	events := make([]harness.Event, 0)
 	messages := make([]apiMessage, 0)
 
-	sessionCacheMu := lockSSECache(conn.OpencodeID)
+	sessionCacheMu := lockSSECache(conn.HarnessID)
 	sseCacheMu.Lock()
-	delete(SSECache, conn.OpencodeID)
+	delete(SSECache, conn.HarnessID)
 	sseCacheMu.Unlock()
 	sessionCacheMu.Unlock()
 	var first string

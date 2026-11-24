@@ -38,7 +38,7 @@ type itemEventRef struct {
 
 type SessionConn struct {
 	mu                 sync.Mutex
-	codexThreadID      string
+	harnessID          string
 	codexTurnID        string
 	isWriter           bool
 	firstMetadataErrAt time.Time
@@ -50,9 +50,9 @@ type SessionConn struct {
 }
 
 var (
-	cacheMu   sync.Mutex
-	conns     = map[string]map[string]*SessionConn{}
-	threadIDs = map[string]map[string]string{}
+	cacheMu           sync.Mutex
+	conns             = map[string]map[string]*SessionConn{}
+	sessIDToHarnessID = map[string]map[string]string{}
 )
 
 func (*Adapter) Ready() error { return ensureRPC() }
@@ -111,7 +111,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 	var sessions []harness.SessionLite
 	cacheMu.Lock()
 	mappedThreads := map[string]bool{}
-	for _, id := range threadIDs[realFolder] {
+	for _, id := range sessIDToHarnessID[realFolder] {
 		mappedThreads[id] = true
 	}
 	cacheMu.Unlock()
@@ -173,7 +173,7 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	cached := conns[s.RealPath][id]
 	threadID := id
 	if isLocal {
-		threadID = threadIDs[s.RealPath][id]
+		threadID = sessIDToHarnessID[s.RealPath][id]
 	}
 	cacheMu.Unlock()
 	// History refreshes must not resume a healthy, possibly unsaved thread.
@@ -216,7 +216,7 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 		return errors.New("Codex returned no thread ID")
 	}
 	c.mu.Lock()
-	c.codexThreadID = result.Thread.ID
+	c.harnessID = result.Thread.ID
 	c.isWriter = method == "thread/start"
 	c.mu.Unlock()
 	connRPC0.mu.Lock()
@@ -225,10 +225,10 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	cacheMu.Lock()
 
 	if isLocal {
-		if threadIDs[s.RealPath] == nil {
-			threadIDs[s.RealPath] = map[string]string{}
+		if sessIDToHarnessID[s.RealPath] == nil {
+			sessIDToHarnessID[s.RealPath] = map[string]string{}
 		}
-		threadIDs[s.RealPath][id] = result.Thread.ID
+		sessIDToHarnessID[s.RealPath][id] = result.Thread.ID
 	}
 	if conns[s.RealPath] == nil {
 		conns[s.RealPath] = map[string]*SessionConn{}
@@ -247,7 +247,7 @@ func (a *Adapter) CleanUp(s *harness.Session) error {
 	cacheMu.Unlock()
 	if c != nil {
 		c.mu.Lock()
-		threadID, isWriter := c.codexThreadID, c.isWriter
+		threadID, isWriter := c.harnessID, c.isWriter
 		c.mu.Unlock()
 
 		// if its writer, we actually unsub to try to give back control to other clients
@@ -287,13 +287,13 @@ func (a *Adapter) Delete(s *harness.Session) error {
 		return errors.New("cannot delete a busy Codex session")
 	}
 	cacheMu.Lock()
-	threadID := threadIDs[s.RealPath][s.ID]
+	threadID := sessIDToHarnessID[s.RealPath][s.ID]
 	c := conns[s.RealPath][s.ID]
 	cacheMu.Unlock()
 	if c != nil {
 		c.mu.Lock()
-		if c.codexThreadID != "" {
-			threadID = c.codexThreadID
+		if c.harnessID != "" {
+			threadID = c.harnessID
 		}
 		c.mu.Unlock()
 	}
@@ -307,7 +307,13 @@ func (a *Adapter) Delete(s *harness.Session) error {
 		return err
 	}
 	_, _, err := connRPC0.call("thread/delete", map[string]any{"threadId": threadID})
-	return err
+	if err != nil {
+		return err
+	}
+	cacheMu.Lock()
+	delete(sessIDToHarnessID[s.RealPath], s.ID)
+	cacheMu.Unlock()
+	return nil
 }
 
 func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
@@ -316,7 +322,7 @@ func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
 		return err
 	}
 	c.mu.Lock()
-	threadID, isWriter := c.codexThreadID, c.isWriter
+	threadID, isWriter := c.harnessID, c.isWriter
 	c.mu.Unlock()
 	if !isWriter {
 		if _, _, err := connRPC0.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
@@ -352,7 +358,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		input = append(input, map[string]any{"type": "image", "url": uri})
 	}
 	c.mu.Lock()
-	threadID, isWriter := c.codexThreadID, c.isWriter
+	threadID, isWriter := c.harnessID, c.isWriter
 	c.mu.Unlock()
 
 	// swap the connection to write (if needed)
@@ -407,7 +413,7 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	if turn == "" {
 		return nil
 	}
-	_, _, err = connRPC0.call("turn/interrupt", map[string]any{"threadId": c.codexThreadID, "turnId": turn})
+	_, _, err = connRPC0.call("turn/interrupt", map[string]any{"threadId": c.harnessID, "turnId": turn})
 	return err
 }
 
@@ -697,7 +703,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(raw, &params) != nil || params.ThreadID != c.codexThreadID {
+		if json.Unmarshal(raw, &params) != nil || params.ThreadID != c.harnessID {
 			return
 		}
 		switch method {
@@ -743,7 +749,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.Mu.Unlock()
 	c.mu.Lock()
 	full = full || !c.isLoaded
-	threadID := c.codexThreadID
+	threadID := c.harnessID
 	c.mu.Unlock()
 	_processEvents := func(afterSequence uint64, includeBeforeSnapshotItems bool) {
 		for _, event := range updates {

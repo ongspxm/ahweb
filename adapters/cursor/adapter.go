@@ -28,7 +28,7 @@ type conn struct {
 	cmd          *exec.Cmd
 	stderr       bytes.Buffer
 	events       []harness.Event
-	cursorID     string
+	harnessID    string
 	isStopped    bool
 	isClosing    bool
 	processDone  chan struct{}
@@ -41,9 +41,10 @@ type conn struct {
 }
 
 var (
-	cacheMu   sync.Mutex
-	cache     = make(map[string]map[string]*conn)
-	cursorIDs = make(map[string]map[string]string)
+	cacheMu           sync.Mutex
+	cache             = make(map[string]map[string]*conn)
+	harnessIDToSessID = make(map[string]map[string]string)
+	sessIDToHarnessID = make(map[string]map[string]string)
 )
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
@@ -86,8 +87,8 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		cursorID := entry.Name()
-		path := filepath.Join(root, cursorID, cursorID+".jsonl")
+		harnessID := entry.Name()
+		path := filepath.Join(root, harnessID, harnessID+".jsonl")
 		file, err := os.Open(path)
 		if err != nil {
 			continue
@@ -138,13 +139,10 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		}
 
 		// A session created in this run has a local ID; do not list its chat twice.
-		sessID := cursorID
+		sessID := harnessID
 		cacheMu.Lock()
-		for cachedSessID, cachedCursorID := range cursorIDs[realFolder] {
-			if cachedCursorID == cursorID || sessionUUID(cachedSessID) == cursorID {
-				sessID = cachedSessID
-				break
-			}
+		if mappedID := harnessIDToSessID[realFolder][harnessID]; mappedID != "" {
+			sessID = mappedID
 		}
 		cacheMu.Unlock()
 		lite := harness.SessionLite{ID: sessID, RealPath: realFolder, Harness: "cursor", FirstUserMsg: first, LastTimestampMs: info.ModTime().UnixMilli()}
@@ -164,18 +162,22 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	if cache[s.RealPath] == nil {
 		cache[s.RealPath] = make(map[string]*conn)
 	}
-	if cursorIDs[s.RealPath] == nil {
-		cursorIDs[s.RealPath] = make(map[string]string)
+	if harnessIDToSessID[s.RealPath] == nil {
+		harnessIDToSessID[s.RealPath] = make(map[string]string)
+	}
+	if sessIDToHarnessID[s.RealPath] == nil {
+		sessIDToHarnessID[s.RealPath] = make(map[string]string)
 	}
 	if cache[s.RealPath][s.ID] == nil {
-		cursorID := cursorIDs[s.RealPath][s.ID]
-		if cursorID == "" {
-			cursorID = sessionUUID(s.ID)
-			if _, err := os.Stat(transcriptPath(s.RealPath, cursorID)); err != nil {
-				cursorID = ""
-			}
+		harnessID := sessionUUID(s.ID)
+		if _, err := os.Stat(transcriptPath(s.RealPath, harnessID)); err != nil {
+			harnessID = ""
 		}
-		cache[s.RealPath][s.ID] = &conn{events: append([]harness.Event(nil), s.Events...), cursorID: cursorID}
+		cache[s.RealPath][s.ID] = &conn{events: append([]harness.Event(nil), s.Events...), harnessID: harnessID}
+		if harnessID != "" {
+			harnessIDToSessID[s.RealPath][harnessID] = s.ID
+			sessIDToHarnessID[s.RealPath][s.ID] = harnessID
+		}
 	}
 	return nil
 }
@@ -259,8 +261,8 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		return errors.New("Cursor session is busy")
 	}
 	args := []string{"-p", "--output-format", "stream-json", "--force"}
-	if c.cursorID != "" {
-		args = append(args, "--resume", c.cursorID)
+	if c.harnessID != "" {
+		args = append(args, "--resume", c.harnessID)
 	}
 	if model != nil && model.ID != "" {
 		args = append(args, "--model", strings.TrimPrefix(model.ID, "cursor/"))
@@ -320,15 +322,13 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			switch kind {
 			case "system":
 				if subtype, _ := msg["subtype"].(string); subtype == "init" {
-					if cursorID, _ := msg["session_id"].(string); cursorID != "" {
+					if harnessID, _ := msg["session_id"].(string); harnessID != "" {
 						c.mu.Lock()
-						c.cursorID = cursorID
+						c.harnessID = harnessID
 						c.mu.Unlock()
 						cacheMu.Lock()
-						if cursorIDs[s.RealPath] == nil {
-							cursorIDs[s.RealPath] = make(map[string]string)
-						}
-						cursorIDs[s.RealPath][s.ID] = cursorID
+						harnessIDToSessID[s.RealPath][harnessID] = s.ID
+						sessIDToHarnessID[s.RealPath][s.ID] = harnessID
 						cacheMu.Unlock()
 					}
 				}
@@ -451,11 +451,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	fullHistory := s.DoFullHistory
 	s.Mu.Unlock()
 	c.mu.Lock()
-	cursorID := c.cursorID
+	harnessID := c.harnessID
 
 	// full session reading if cursor sess exist
-	if fullHistory && cursorID != "" {
-		file, err := os.Open(transcriptPath(s.RealPath, cursorID))
+	if fullHistory && harnessID != "" {
+		file, err := os.Open(transcriptPath(s.RealPath, harnessID))
 		if err == nil {
 			if info, err := file.Stat(); err == nil {
 				stamp := info.ModTime().UnixMilli()
@@ -576,7 +576,7 @@ func sessionUUID(sessID string) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
 }
 
-func transcriptPath(realPath, cursorID string) string {
+func transcriptPath(realPath, harnessID string) string {
 	// Mirror Cursor's project folder name: replace separators and dots, then collapse dashes.
 	key := strings.NewReplacer("\\", "-", "/", "-", ".", "-").Replace(realPath)
 	for strings.Contains(key, "--") {
@@ -584,10 +584,10 @@ func transcriptPath(realPath, cursorID string) string {
 	}
 	home, _ := os.UserHomeDir()
 	root := filepath.Join(home, ".cursor", "projects", strings.Trim(key, "-"), "agent-transcripts")
-	if cursorID == "" {
+	if harnessID == "" {
 		return root
 	}
-	return filepath.Join(root, cursorID, cursorID+".jsonl")
+	return filepath.Join(root, harnessID, harnessID+".jsonl")
 }
 
 func contentParts(content any) []map[string]any {

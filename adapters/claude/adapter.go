@@ -46,8 +46,10 @@ type conn struct {
 
 var (
 	// cache[realPath][sessid]
-	cacheMu sync.Mutex
-	cache   = make(map[string]map[string]*conn)
+	cacheMu           sync.Mutex
+	cache             = make(map[string]map[string]*conn)
+	harnessIDToSessID = make(map[string]map[string]string)
+	sessIDToHarnessID = make(map[string]map[string]string)
 )
 
 func (*Adapter) GetModels() (map[string]harness.Model, error) {
@@ -139,11 +141,8 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		}
 		localID := nativeID
 		cacheMu.Lock()
-		for id := range cache[realFolder] {
-			if sessionUUID(id) == canonicalID {
-				localID = id
-				break
-			}
+		if sessID := harnessIDToSessID[realFolder][nativeID]; sessID != "" {
+			localID = sessID
 		}
 		cacheMu.Unlock()
 		lite := harness.SessionLite{ID: localID, RealPath: realFolder, Harness: "claude"}
@@ -205,12 +204,20 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	}
 	c := cache[s.RealPath][s.ID]
 	if c == nil {
-		sessionID := sessionUUID(s.ID)
+		sessID := sessionUUID(s.ID)
 		c = &conn{events: append([]harness.Event(nil), s.Events...)}
-		if _, err := os.Stat(transcriptPath(s.RealPath, sessionID)); err == nil {
+		if _, err := os.Stat(transcriptPath(s.RealPath, sessID)); err == nil {
 			c.isExist = true
 		}
 		cache[s.RealPath][s.ID] = c
+		if harnessIDToSessID[s.RealPath] == nil {
+			harnessIDToSessID[s.RealPath] = make(map[string]string)
+		}
+		if sessIDToHarnessID[s.RealPath] == nil {
+			sessIDToHarnessID[s.RealPath] = make(map[string]string)
+		}
+		harnessIDToSessID[s.RealPath][sessID] = s.ID
+		sessIDToHarnessID[s.RealPath][s.ID] = sessID
 	}
 	cacheMu.Unlock()
 	return nil
@@ -491,9 +498,9 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	// evts from full history
 	if fullHistory {
 		c.mu.Lock()
-		sessionID := sessionUUID(s.ID)
-		if _, err := os.Stat(transcriptPath(s.RealPath, sessionID)); err == nil {
-			if f, err := os.Open(transcriptPath(s.RealPath, sessionID)); err == nil {
+		sessID := sessionUUID(s.ID)
+		if _, err := os.Stat(transcriptPath(s.RealPath, sessID)); err == nil {
+			if f, err := os.Open(transcriptPath(s.RealPath, sessID)); err == nil {
 				defer f.Close()
 				scanner := bufio.NewScanner(f)
 				scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
@@ -704,9 +711,9 @@ func sessionUUID(id string) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
 }
 
-func transcriptPath(realFolder, sessionID string) string {
+func transcriptPath(realFolder, sessID string) string {
 	home, _ := os.UserHomeDir()
 	encoded := strings.TrimLeft(strings.ReplaceAll(realFolder, "\\", "/"), "/")
 	encoded = strings.ReplaceAll(strings.ReplaceAll(encoded, "/", "-"), ".", "-")
-	return filepath.Join(home, ".claude", "projects", "-"+encoded, sessionID+".jsonl")
+	return filepath.Join(home, ".claude", "projects", "-"+encoded, sessID+".jsonl")
 }

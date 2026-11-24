@@ -205,19 +205,16 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		if err := rows.Scan(&id, &cwd, &summary, &created, &updated); err != nil {
 			continue
 		}
-		canonicalID := strings.ReplaceAll(id, "-", "")
-		if seen[canonicalID] {
-			continue
-		}
 		localID := id
 		cacheMu.Lock()
-		for sessID, copilotID := range copilotIDs[realFolder] {
-			if strings.ReplaceAll(copilotID, "-", "") == canonicalID {
-				localID = sessID
-				break
-			}
+		if sessID := harnessIDToSessID[realFolder][id]; sessID != "" {
+			localID = sessID
 		}
 		cacheMu.Unlock()
+		if seen[localID] {
+			continue
+		}
+
 		lite := harness.SessionLite{ID: localID, RealPath: cwd, Harness: "copilot", FirstUserMsg: summary}
 		for _, value := range []string{updated, created} {
 			if stamp, err := time.Parse(time.RFC3339Nano, value); err == nil {
@@ -225,7 +222,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 				break
 			}
 		}
-		seen[canonicalID] = true
+		seen[localID] = true
 		sessions = append(sessions, lite)
 	}
 	return sessions, rows.Err()
@@ -237,7 +234,7 @@ type conn struct {
 	mu                     sync.Mutex
 	cmd                    *exec.Cmd
 	done                   chan struct{}
-	copilotID              string
+	harnessID              string
 	busy, closing, started bool
 
 	events, errors []harness.Event
@@ -245,9 +242,10 @@ type conn struct {
 }
 
 var (
-	cacheMu    sync.Mutex
-	cache      = make(map[string]map[string]*conn)
-	copilotIDs = make(map[string]map[string]string)
+	cacheMu           sync.Mutex
+	cache             = make(map[string]map[string]*conn)
+	harnessIDToSessID = make(map[string]map[string]string)
+	sessIDToHarnessID = make(map[string]map[string]string)
 )
 
 func (*Adapter) Connect(s *harness.Session, _ bool) error {
@@ -256,20 +254,25 @@ func (*Adapter) Connect(s *harness.Session, _ bool) error {
 	if cache[s.RealPath] == nil {
 		cache[s.RealPath] = make(map[string]*conn)
 	}
-	if copilotIDs[s.RealPath] == nil {
-		copilotIDs[s.RealPath] = make(map[string]string)
+	if harnessIDToSessID[s.RealPath] == nil {
+		harnessIDToSessID[s.RealPath] = make(map[string]string)
+	}
+	if sessIDToHarnessID[s.RealPath] == nil {
+		sessIDToHarnessID[s.RealPath] = make(map[string]string)
 	}
 	if cache[s.RealPath][s.ID] == nil {
-		copilotID := s.ID
-		if !strings.Contains(copilotID, "-") {
-			if decoded, err := hex.DecodeString(copilotID); err == nil && len(decoded) == 16 {
+		harnessID := s.ID
+		if !strings.Contains(harnessID, "-") {
+			if decoded, err := hex.DecodeString(harnessID); err == nil && len(decoded) == 16 {
 				decoded[6] = decoded[6]&0x0f | 0x40
 				decoded[8] = decoded[8]&0x3f | 0x80
-				copilotID = fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
+				harnessID = fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
 			}
 		}
-		copilotIDs[s.RealPath][s.ID] = copilotID
-		cache[s.RealPath][s.ID] = &conn{copilotID: copilotID}
+		harnessIDToSessID[s.RealPath][s.ID] = s.ID
+		harnessIDToSessID[s.RealPath][harnessID] = s.ID
+		sessIDToHarnessID[s.RealPath][s.ID] = harnessID
+		cache[s.RealPath][s.ID] = &conn{harnessID: harnessID}
 	}
 	return nil
 }
@@ -293,7 +296,58 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 	}
 	cacheMu.Lock()
 	delete(cache[s.RealPath], s.ID)
-	delete(copilotIDs[s.RealPath], s.ID)
+	cacheMu.Unlock()
+	return nil
+}
+
+func (*Adapter) CanDelete() bool { return true }
+
+func (a *Adapter) Delete(s *harness.Session) error {
+	if s.GetIsBusy() {
+		return errors.New("cannot delete a busy Copilot session")
+	}
+
+	cacheMu.Lock()
+	c := cache[s.RealPath][s.ID]
+	harnessID := sessIDToHarnessID[s.RealPath][s.ID]
+	cacheMu.Unlock()
+	if c != nil {
+		c.mu.Lock()
+		if c.busy || c.closing {
+			c.mu.Unlock()
+			return errors.New("cannot delete a busy Copilot session")
+		}
+		c.mu.Unlock()
+	}
+
+	if err := a.CleanUp(s); err != nil {
+		return err
+	}
+	stateDir := filepath.Join(copilotHome(), "session-state", harnessID)
+	if err := os.RemoveAll(stateDir); err != nil {
+		return fmt.Errorf("could not remove Copilot session state: %w", err)
+	}
+
+	db, err := copilotDB()
+	if err != nil {
+		if os.IsNotExist(err) {
+			cacheMu.Lock()
+			delete(harnessIDToSessID[s.RealPath], harnessID)
+			delete(harnessIDToSessID[s.RealPath], s.ID)
+			delete(sessIDToHarnessID[s.RealPath], s.ID)
+			cacheMu.Unlock()
+			return nil
+		}
+		return fmt.Errorf("could not open Copilot session store: %w", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, harnessID); err != nil {
+		return fmt.Errorf("could not remove Copilot session index: %w", err)
+	}
+	cacheMu.Lock()
+	delete(harnessIDToSessID[s.RealPath], harnessID)
+	delete(harnessIDToSessID[s.RealPath], s.ID)
+	delete(sessIDToHarnessID[s.RealPath], s.ID)
 	cacheMu.Unlock()
 	return nil
 }
@@ -316,7 +370,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		c.mu.Unlock()
 		return errors.New("Copilot session is busy")
 	}
-	id := c.copilotID
+	id := c.harnessID
 	if strings.Contains(s.ID, "-") || c.started {
 		args = append(args, "--resume="+id)
 	} else {
@@ -428,7 +482,11 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			switch msg.Type {
 			case "session.start":
 				if id, _ := msg.Data["sessionId"].(string); id != "" {
-					c.copilotID = id
+					c.harnessID = id
+					cacheMu.Lock()
+					harnessIDToSessID[s.RealPath][id] = s.ID
+					sessIDToHarnessID[s.RealPath][s.ID] = id
+					cacheMu.Unlock()
 				}
 			case "session.usage_info":
 				if used, ok := msg.Data["used"].(float64); ok {
@@ -470,7 +528,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	// SQLite provides usage totals; events.jsonl provides conversation history.
 	c.mu.Lock()
 	busy := c.busy
-	copilotID := c.copilotID
+	harnessID := c.harnessID
 	c.mu.Unlock()
 
 	_readSessionEvents := func(id string) []harness.Event {
@@ -502,7 +560,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	c.mu.Lock()
 	var events []harness.Event
 	if fullHistory {
-		events = _readSessionEvents(copilotID)
+		events = _readSessionEvents(harnessID)
 	} else {
 		s.Mu.Lock()
 		events = append([]harness.Event(nil), s.Events...)
@@ -519,8 +577,8 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	dbCost := 0.0
 	if db, err := copilotDB(); err == nil {
 		defer db.Close()
-		_ = db.QueryRow(`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) FROM assistant_usage_events WHERE session_id = ?`, copilotID).Scan(&dbInput, &dbOutput, &dbCacheRead, &dbCacheWrite)
-		_ = db.QueryRow(`SELECT COALESCE(SUM(total_nano_aiu), 0) FROM assistant_usage_events WHERE session_id = ?`, copilotID).Scan(&totalNanoAiu)
+		_ = db.QueryRow(`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) FROM assistant_usage_events WHERE session_id = ?`, harnessID).Scan(&dbInput, &dbOutput, &dbCacheRead, &dbCacheWrite)
+		_ = db.QueryRow(`SELECT COALESCE(SUM(total_nano_aiu), 0) FROM assistant_usage_events WHERE session_id = ?`, harnessID).Scan(&totalNanoAiu)
 		dbCost = float64(totalNanoAiu) / 1_000_000_000 * 0.01
 	}
 
@@ -583,7 +641,17 @@ func copilotHome() string {
 
 func copilotDB() (*sql.DB, error) {
 	path := filepath.Join(copilotHome(), "session-store.db")
-	return sql.Open("sqlite3", "file:"+path+"?mode=ro")
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", "file:"+path+"?mode=rw")
+	if err != nil {
+		if db != nil {
+			_ = db.Close()
+		}
+		return nil, err
+	}
+	return db, nil
 }
 
 type copilotMsg struct {

@@ -22,7 +22,7 @@ type SessionConn struct {
 	MsgCursor       int
 	EventSequence   uint64
 	EventGeneration string
-	ActiveSessionID string
+	HarnessID       string
 }
 
 const (
@@ -308,7 +308,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 }
 
 func (c *SessionConn) call(command string, params map[string]any, data any) error {
-	return connCmd0.call(c.ActiveSessionID, command, params, data)
+	return connCmd0.call(c.HarnessID, command, params, data)
 }
 
 // === session admin fns
@@ -322,7 +322,7 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 	}
 
 	conn.Mu.Lock()
-	if conn.ActiveSessionID != "" {
+	if conn.HarnessID != "" {
 		unsub(conn)
 		var state struct {
 			AttachedClients int `json:"attachedClients"`
@@ -331,7 +331,7 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 			_ = conn.call("kill", nil, nil)
 		}
 	}
-	conn.ActiveSessionID, conn.MsgCursor = "", 0
+	conn.HarnessID, conn.MsgCursor = "", 0
 	conn.EventSequence, conn.EventGeneration = 0, ""
 	conn.Mu.Unlock()
 
@@ -369,12 +369,12 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 			return err
 		}
 	}
-	if conn.ActiveSessionID != "" {
+	if conn.HarnessID != "" {
 		var state struct {
 			IsStreaming bool `json:"isStreaming"`
 		}
 		if err := conn.call("get_state", nil, &state); err == nil {
-			wasListening := connEvt0.isSub(conn.ActiveSessionID)
+			wasListening := connEvt0.isSub(conn.HarnessID)
 			_ = sub(conn)
 			if force || !wasListening {
 				if !wasListening {
@@ -387,7 +387,7 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 			return nil
 		}
 		unsub(conn)
-		conn.ActiveSessionID, conn.MsgCursor = "", 0
+		conn.HarnessID, conn.MsgCursor = "", 0
 		conn.EventSequence, conn.EventGeneration = 0, ""
 	}
 
@@ -432,8 +432,8 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 
 	// checked: the create cmd to the daemon works even for multi connection
 	var created struct {
-		ActiveSessionID string `json:"activeSessionId"`
-		SessionID       string `json:"sessionId"`
+		HarnessID string `json:"activeSessionId"`
+		SessID    string `json:"sessionId"`
 	}
 	if err := conn.call("create", map[string]any{
 		"sessionPath": path,
@@ -445,13 +445,13 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 		}
 		return fmt.Errorf("prime daemon could not create session: %w", err)
 	}
-	if created.SessionID != "" && created.SessionID != s.ID {
-		return fmt.Errorf("prime daemon created unexpected session %s", created.SessionID)
+	if created.SessID != "" && created.SessID != s.ID {
+		return fmt.Errorf("prime daemon created unexpected session %s", created.SessID)
 	}
-	if created.ActiveSessionID == "" {
+	if created.HarnessID == "" {
 		return errors.New("prime daemon returned no active session")
 	}
-	conn.ActiveSessionID, conn.MsgCursor = created.ActiveSessionID, 0
+	conn.HarnessID, conn.MsgCursor = created.HarnessID, 0
 	conn.EventSequence, conn.EventGeneration = 0, ""
 	_ = sub(conn)
 	s.Mu.Lock()
@@ -606,7 +606,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" {
+	if conn.HarnessID == "" {
 		return errors.New("prime session is not connected")
 	}
 	if err := connCmd0.chkConnection(); err != nil {
@@ -661,7 +661,7 @@ func (a *Adapter) Stop(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" || connCmd0.chkConnection() != nil {
+	if conn.HarnessID == "" || connCmd0.chkConnection() != nil {
 		return nil
 	}
 	err = conn.call("abort", nil, nil)
@@ -678,7 +678,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
-	if conn.ActiveSessionID == "" {
+	if conn.HarnessID == "" {
 		return errors.New("prime session is not connected")
 	}
 	if err := connCmd0.chkConnection(); err != nil {
@@ -688,7 +688,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.Mu.Lock()
 	full := s.DoFullHistory
 	s.Mu.Unlock()
-	if !connEvt0.isSub(conn.ActiveSessionID) {
+	if !connEvt0.isSub(conn.HarnessID) {
 		_ = sub(conn)
 		full = true
 		conn.EventSequence, conn.EventGeneration = 0, ""
@@ -696,11 +696,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		s.DoFullHistory = true
 		s.Mu.Unlock()
 	}
-	updates, needsFull := connEvt0.drainSub(conn.ActiveSessionID)
+	updates, needsFull := connEvt0.drainSub(conn.HarnessID)
 	committed := false
 	defer func() {
 		if !committed {
-			connEvt0.undrainSub(conn.ActiveSessionID, updates, needsFull)
+			connEvt0.undrainSub(conn.HarnessID, updates, needsFull)
 		}
 	}()
 	full = full || needsFull
@@ -718,7 +718,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	ids := []string(nil)
 
 	rebuild := full
-	refreshMessages := full || !connEvt0.isSub(conn.ActiveSessionID)
+	refreshMessages := full || !connEvt0.isSub(conn.HarnessID)
 	messageCountDelta := 0
 	nextEventSequence, nextEventGeneration := conn.EventSequence, conn.EventGeneration
 

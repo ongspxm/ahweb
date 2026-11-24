@@ -12,7 +12,7 @@ import (
 	"github.com/ongspxm/ahweb/harness"
 )
 
-type OpencodeID = string
+type HarnessID = string
 
 var (
 	eventListenerMu      sync.Mutex
@@ -20,10 +20,10 @@ var (
 	activityMu           sync.Mutex
 	sseCacheMu           sync.Mutex
 	sseCacheLocks        sync.Map
-	SSECache             = make(map[OpencodeID][]json.RawMessage)
+	SSECache             = make(map[HarnessID][]json.RawMessage)
 )
 
-func lockSSECache(id OpencodeID) *sync.Mutex {
+func lockSSECache(id HarnessID) *sync.Mutex {
 	value, _ := sseCacheLocks.LoadOrStore(id, &sync.Mutex{})
 	mu := value.(*sync.Mutex)
 	mu.Lock()
@@ -199,7 +199,7 @@ func (m apiMessage) events() []harness.Event {
 	return out
 }
 
-func processSSECache(id OpencodeID, discardIncomplete bool) ([]apiMessage, []apiUsage, bool) {
+func processSSECache(id HarnessID, discardIncomplete bool) ([]apiMessage, []apiUsage, bool) {
 	// called on each sessions's Poll(), will merge raw msgs and keep incomplete msgs cached.
 	cacheMu := lockSSECache(id)
 	defer cacheMu.Unlock()
@@ -437,7 +437,7 @@ func ensureEventListenerUp() {
 							sessions = append(sessions, struct {
 								id      string
 								session *harness.Session
-							}{conn.OpencodeID, conn.session})
+							}{conn.HarnessID, conn.session})
 						}
 					}
 				}
@@ -541,7 +541,7 @@ func ensureEventListenerUp() {
 									var sessions []*harness.Session
 									for _, byID := range cache {
 										for _, conn := range byID {
-											if conn.OpencodeID == id && conn.session != nil {
+											if conn.HarnessID == id && conn.session != nil {
 												sessions = append(sessions, conn.session)
 											}
 										}
