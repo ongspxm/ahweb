@@ -25,3 +25,8 @@ repos:
     hooks:
       - id: biome-check
         types_or: [html, javascript, css]
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.6
+    hooks:
+      - id: shellcheck
+        args: [--exclude=SC1091]
