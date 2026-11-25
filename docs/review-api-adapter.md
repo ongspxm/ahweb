@@ -45,6 +45,13 @@ Verify: Search for direct adapter calls and confirm they occur only in the poll 
 
 Severity: P1 if concurrent or inconsistent session state may result.
 
+## ADAPTER-004: no test files in adapter packages
+
+Trigger: Keep adapter logic clean, align with the Adapter interface. No need per-adapter unit tests.
+Glob `adapters/**/*_test.go` and confirm zero matches.
+
+Severity: P2 if tests live under `adapters/`.
+
 ## ENDPOINT-003: always keep Adapter interface document updated in README.md
 
 Trigger: keep the README updated of any Adpater changes

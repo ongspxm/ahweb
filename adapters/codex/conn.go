@@ -204,7 +204,10 @@ func ensureRPC() error {
 			}
 		}()
 
-		if _, _, err := rpc.call("initialize", map[string]any{"clientInfo": map[string]string{"name": "ahweb", "title": "ahweb", "version": "1"}}); err != nil {
+		if _, _, err := rpc.call("initialize", map[string]any{
+			"clientInfo":   map[string]string{"name": "ahweb", "title": "ahweb", "version": "1"},
+			"capabilities": map[string]any{"experimentalApi": true},
+		}); err != nil {
 			rpc.close()
 			return nil, err
 		}

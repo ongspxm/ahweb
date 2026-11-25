@@ -1,9 +1,10 @@
 # devlog
-entries should roughly be along the lines of: explain why the change
-describe current situation, what should be the new change
-roughly wut the shape of the change look like in each of api/webui
-okay to split multiline, one point one line. (look at past entry for eg)
+entries should roughly be along the lines of:
+- explain why the change
+- describe current situation, what should be the new change
+- roughly wut the shape of the change look like in each of api/webui
 
+okay to split multiline, one point one line. (look at past entry for eg)
 states: TODO for new, DONE for completed, PARK for in the future. REJECT for dun fix.
 ORDER: older entries at the bottom
 
@@ -14,8 +15,29 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
+todos:
+- copilot harness, the assistant message not populating the model + effort
+
+## 2026-11-25 DONE. webui Mermaid popup parser
+mermaid SVG has HTML inside foreignObject, like br tags, so strict XML parsing breaks the popup.
+webui. parse mermaid output as text/html instead of text/svg
+
 ## 2026-11-23 TODO. copilot adapter, impl child session
 copliot harness, impl child session
+
+## 2026-11-23 TODO. adapter child sessions
+Codex subagents should appear as separate child sessions under the parent.
+But now all the messages and tool calls lump under the parent session
+
+Adapter needs to take child harnessID and init a session from that
+Live events and historical poll should pipe the msgs to child session, not parent
+
+Parent session should show subagent start and end too calls
+
+Repro: run ahweb on a temporary port and use folder /tmp/ahweb-child-session-repro.
+POST /api/prompt with harness=codex and this prompt: Use subagents to do this task: have one subagent inspect the files in this directory and report their names, and another subagent independently report the current date. Return both reports and clearly identify each subagent. Do not do the work yourself.
+GET /api/list?folder=<folder> until it returns parent and child sessions. Verify each child has its own sessid and parent_sessid equal to the parent sessid.
+GET /api/events?folder=<folder>&sessid=<child-sessid>&harness=codex for each child; verify child events are returned.
 
 ## 2026-11-24 PARK. copilot adapter rewind
 copilot CLI exposes resume/continue/session-id, but no rewind/revert/fork operation.

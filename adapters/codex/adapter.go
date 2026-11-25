@@ -53,6 +53,8 @@ var (
 	cacheMu           sync.Mutex
 	conns             = map[string]map[string]*SessionConn{}
 	sessIDToHarnessID = map[string]map[string]string{}
+	harnessIDToSessID = map[string]map[string]string{}
+	harnessIDToPrompt = map[string]map[string]string{}
 )
 
 func (*Adapter) Ready() error { return ensureRPC() }
@@ -108,46 +110,133 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 	if err := ensureRPC(); err != nil {
 		return nil, err
 	}
-	var sessions []harness.SessionLite
-	cacheMu.Lock()
-	mappedThreads := map[string]bool{}
-	for _, id := range sessIDToHarnessID[realFolder] {
-		mappedThreads[id] = true
+
+	type harnessSession struct {
+		ID            string          `json:"id"`
+		Preview       string          `json:"preview"`
+		Name          string          `json:"name"`
+		AgentNickname string          `json:"agentNickname"`
+		UpdatedAt     int64           `json:"updatedAt"`
+		ParentID      string          `json:"parentThreadId"`
+		Source        json.RawMessage `json:"source"`
 	}
-	cacheMu.Unlock()
-	cursor := ""
-	for {
-		params := map[string]any{"cwd": realFolder, "limit": 100, "sortKey": "updated_at", "sortDirection": "desc"}
-		if cursor != "" {
-			params["cursor"] = cursor
+	_listSessions := func(baseParams map[string]any) ([]harnessSession, error) {
+		var sessions []harnessSession
+		cursor := ""
+		for {
+			params := make(map[string]any, len(baseParams)+1)
+			for k, v := range baseParams {
+				params[k] = v
+			}
+			if cursor != "" {
+				params["cursor"] = cursor
+			}
+			raw, _, err := connRPC0.call("thread/list", params)
+			if err != nil {
+				return nil, err
+			}
+			var result struct {
+				Data       []harnessSession `json:"data"`
+				NextCursor *string          `json:"nextCursor"`
+			}
+			if err := decode(raw, &result); err != nil {
+				return nil, err
+			}
+			sessions = append(sessions, result.Data...)
+			if result.NextCursor == nil || *result.NextCursor == "" {
+				break
+			}
+			cursor = *result.NextCursor
 		}
-		raw, _, err := connRPC0.call("thread/list", params)
+		return sessions, nil
+	}
+	_toSessionLite := func(hs harnessSession) harness.SessionLite {
+		var source struct {
+			SubAgent struct {
+				ThreadSpawn struct {
+					AgentPath      string `json:"agent_path"`
+					AgentNickname  string `json:"agent_nickname"`
+					ParentThreadID string `json:"parent_thread_id"`
+				} `json:"thread_spawn"`
+			} `json:"subAgent"`
+		}
+		_ = json.Unmarshal(hs.Source, &source)
+		spawn := source.SubAgent.ThreadSpawn
+
+		id := hs.ID
+		if local := harnessIDToSessID[realFolder][hs.ID]; local != "" {
+			id = local
+		}
+		parentID := hs.ParentID
+		if parentID == "" {
+			parentID = spawn.ParentThreadID
+		}
+		if local := harnessIDToSessID[realFolder][parentID]; local != "" {
+			parentID = local
+		}
+
+		firstUserMsg := strings.TrimSpace(hs.Preview)
+		if firstUserMsg == "" {
+			firstUserMsg = strings.TrimSpace(hs.Name)
+		}
+		if firstUserMsg == "" {
+			agentPath := strings.TrimSpace(spawn.AgentPath)
+			nickname := strings.TrimSpace(hs.AgentNickname)
+			if nickname == "" {
+				nickname = strings.TrimSpace(spawn.AgentNickname)
+			}
+			switch {
+			case agentPath != "" && nickname != "":
+				firstUserMsg = agentPath + " (" + nickname + ")"
+			case agentPath != "":
+				firstUserMsg = agentPath
+			case nickname != "":
+				firstUserMsg = nickname
+			}
+		}
+		return harness.SessionLite{
+			ID: id, RealPath: realFolder, Harness: "codex",
+			FirstUserMsg: firstUserMsg, LastTimestampMs: hs.UpdatedAt * 1000,
+			ParentSessID: parentID,
+		}
+	}
+
+	topLevel, err := _listSessions(map[string]any{"cwd": realFolder, "limit": 100, "sortKey": "updated_at", "sortDirection": "desc"})
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []harness.SessionLite
+	seen := make(map[string]bool, len(topLevel))
+	rootIDs := make([]string, 0, len(topLevel))
+	for _, hs := range topLevel {
+		rootIDs = append(rootIDs, hs.ID)
+		if seen[hs.ID] {
+			continue
+		}
+		seen[hs.ID] = true
+		sessions = append(sessions, _toSessionLite(hs))
+	}
+	for harnessID := range harnessIDToSessID[realFolder] {
+		rootIDs = append(rootIDs, harnessID)
+	}
+	rootSeen := make(map[string]bool, len(rootIDs))
+	for _, rootID := range rootIDs {
+		if rootSeen[rootID] {
+			continue
+		}
+		rootSeen[rootID] = true
+		descendants, err := _listSessions(map[string]any{"ancestorThreadId": rootID, "limit": 100, "sortKey": "updated_at", "sortDirection": "desc"})
 		if err != nil {
 			return nil, err
 		}
-		var result struct {
-			Data []struct {
-				ID        string `json:"id"`
-				Preview   string `json:"preview"`
-				UpdatedAt int64  `json:"updatedAt"`
-				ParentID  string `json:"parentThreadId"`
-			} `json:"data"`
-			NextCursor *string `json:"nextCursor"`
-		}
-		if err := decode(raw, &result); err != nil {
-			return nil, err
-		}
-		for _, thread := range result.Data {
-			if mappedThreads[thread.ID] {
+		for _, hs := range descendants {
+			if seen[hs.ID] {
 				continue
 			}
-			lite := harness.SessionLite{ID: thread.ID, RealPath: realFolder, Harness: "codex", FirstUserMsg: thread.Preview, LastTimestampMs: thread.UpdatedAt * 1000, ParentSessID: thread.ParentID}
-			sessions = append(sessions, lite)
+			seen[hs.ID] = true
+			sessions = append(sessions, _toSessionLite(hs))
 		}
-		if result.NextCursor == nil || *result.NextCursor == "" {
-			break
-		}
-		cursor = *result.NextCursor
 	}
 	return sessions, nil
 }
@@ -228,7 +317,11 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 		if sessIDToHarnessID[s.RealPath] == nil {
 			sessIDToHarnessID[s.RealPath] = map[string]string{}
 		}
+		if harnessIDToSessID[s.RealPath] == nil {
+			harnessIDToSessID[s.RealPath] = map[string]string{}
+		}
 		sessIDToHarnessID[s.RealPath][id] = result.Thread.ID
+		harnessIDToSessID[s.RealPath][result.Thread.ID] = id
 	}
 	if conns[s.RealPath] == nil {
 		conns[s.RealPath] = map[string]*SessionConn{}
@@ -312,6 +405,9 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	}
 	cacheMu.Lock()
 	delete(sessIDToHarnessID[s.RealPath], s.ID)
+	delete(harnessIDToSessID[s.RealPath], threadID)
+	delete(harnessIDToPrompt[s.RealPath], threadID)
+	delete(harnessIDToPrompt[s.RealPath], s.ID)
 	cacheMu.Unlock()
 	return nil
 }
@@ -505,6 +601,26 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		return events
 	}
 
+	_childPrompt := func(item map[string]any) (string, []string) {
+		if item["type"] != "collabAgentToolCall" {
+			return "", nil
+		}
+		prompt, _ := item["prompt"].(string)
+		prompt = strings.TrimSpace(prompt)
+		var ids []string
+		switch values := item["receiverThreadIds"].(type) {
+		case []any:
+			for _, value := range values {
+				if id, ok := value.(string); ok && id != "" {
+					ids = append(ids, id)
+				}
+			}
+		case []string:
+			ids = append(ids, values...)
+		}
+		return prompt, ids
+	}
+
 	_convert := func(item map[string]any, timestamp int64, turnID string) []harness.Event {
 		typeName, _ := item["type"].(string)
 		content := _itemText(item)
@@ -615,10 +731,52 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				}
 			}
 			return _toolEvent(name, id, content, content0, timestamp, failed, images, true)
+		case "subAgentActivity":
+			id, _ := item["id"].(string)
+			var parts []string
+			for _, key := range []string{"kind", "agentPath", "agentThreadId"} {
+				if value, _ := item[key].(string); value != "" {
+					parts = append(parts, value)
+				}
+			}
+			// Emit complete immediately because started and completed have distinct item IDs.
+			return _toolEvent("subagent", id, _itemJSON(item, false), strings.Join(parts, " "), timestamp, false, nil, true)
+		case "collabAgentToolCall":
+			id, _ := item["id"].(string)
+			tool, _ := item["tool"].(string)
+			status, _ := item["status"].(string)
+			name := "subagent"
+			if tool != "" {
+				name += ":" + tool
+			}
+			prompt, ids := _childPrompt(item)
+			summary := prompt
+			if summary == "" {
+				summary = strings.Join(ids, ", ")
+			}
+			if chars := []rune(summary); len(chars) > 160 {
+				summary = string(chars[:160])
+			}
+			return _toolEvent(name, id, _itemJSON(item, false), summary, timestamp, status == "failed", nil, status != "inProgress")
 		case "error":
 			return []harness.Event{{Type: harness.EventError, Content: content, TimestampMs: timestamp}}
 		}
 		return nil
+	}
+
+	_rememberChildPrompt := func(item map[string]any) {
+		prompt, childIDs := _childPrompt(item)
+		if prompt == "" {
+			return
+		}
+		cacheMu.Lock()
+		if harnessIDToPrompt[s.RealPath] == nil {
+			harnessIDToPrompt[s.RealPath] = map[string]string{}
+		}
+		for _, childID := range childIDs {
+			harnessIDToPrompt[s.RealPath][childID] = prompt
+		}
+		cacheMu.Unlock()
 	}
 
 	// updates Codex partial events with new info
@@ -627,6 +785,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		if id == "" {
 			return
 		}
+		_rememberChildPrompt(item)
 		next := _convert(item, timestamp, turnID)
 		ref, exists := c.eventRefs[id]
 		if exists && ref.completed && !completed {
@@ -721,6 +880,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		case "turn/completed":
 			if includeItemEvents {
 				for _, item := range params.Turn.Items {
+					_rememberChildPrompt(item)
 					_upsertItem(item, params.Turn.StartedAt*1000, params.Turn.ID, true)
 				}
 				if afterSnapshot {
@@ -790,14 +950,68 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	c.mu.Unlock()
 	var result struct {
 		Thread struct {
-			UpdatedAt int64 `json:"updatedAt"`
-			Status    struct {
+			UpdatedAt      int64  `json:"updatedAt"`
+			ParentThreadID string `json:"parentThreadId"`
+			Status         struct {
 				Type string `json:"type"`
 			} `json:"status"`
 		} `json:"thread"`
 	}
 	if err := decode(raw, &result); err != nil {
 		return err
+	}
+
+	// child prompt lookup
+	childPrompt := ""
+	if result.Thread.ParentThreadID != "" {
+		cacheMu.Lock()
+		childPrompt = harnessIDToPrompt[s.RealPath][threadID]
+		cacheMu.Unlock()
+		if childPrompt == "" {
+			pageRaw, _, err := connRPC0.call("thread/turns/list", map[string]any{
+				"threadId": result.Thread.ParentThreadID, "limit": 100,
+				"sortDirection": "desc", "itemsView": "full",
+			})
+			if err == nil {
+				var page struct {
+					Data []struct {
+						Items []map[string]any `json:"items"`
+					} `json:"data"`
+				}
+				if decode(pageRaw, &page) == nil {
+					for _, turn := range page.Data {
+						for _, item := range turn.Items {
+							prompt, childIDs := _childPrompt(item)
+							for _, childID := range childIDs {
+								if childID == threadID && prompt != "" {
+									childPrompt = prompt
+									cacheMu.Lock()
+									if harnessIDToPrompt[s.RealPath] == nil {
+										harnessIDToPrompt[s.RealPath] = map[string]string{}
+									}
+									harnessIDToPrompt[s.RealPath][threadID] = prompt
+									cacheMu.Unlock()
+									break
+								}
+							}
+							if childPrompt != "" {
+								break
+							}
+						}
+						if childPrompt != "" {
+							break
+						}
+					}
+				}
+			}
+		}
+		if childPrompt != "" {
+			s.Mu.Lock()
+			if s.FirstUserMsg == "" {
+				s.FirstUserMsg = childPrompt
+			}
+			s.Mu.Unlock()
+		}
 	}
 
 	if full {
@@ -845,6 +1059,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		lastTurn := len(turns) - 1
 		for ti, turn := range turns {
 			for ii, item := range turn.Items {
+				_rememberChildPrompt(item)
 				status, _ := item["status"].(string)
 				active := status == "inProgress" || result.Thread.Status.Type == "active" && ti == lastTurn && ii == len(turn.Items)-1
 				if active && item["type"] == "agentMessage" {
@@ -866,13 +1081,42 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				}
 			}
 		}
+
+		// Codex child turns can omit a userMessage; use the matched parent prompt instead.
+		if firstUser == "" && childPrompt != "" {
+			firstUser = childPrompt
+			timestamp := int64(0)
+			if len(turns) > 0 {
+				timestamp = turns[0].StartedAt * 1000
+			}
+			hasUserEvent := false
+			for _, event := range events {
+				if event.Type == harness.EventUser {
+					hasUserEvent = true
+					break
+				}
+			}
+			if !hasUserEvent {
+				events = append([]harness.Event{{
+					Type: harness.EventUser, Content: childPrompt, TimestampMs: timestamp,
+				}}, events...)
+				for id, ref := range refs {
+					for i := range ref.indices {
+						ref.indices[i]++
+					}
+					refs[id] = ref
+				}
+			}
+		}
 		c.eventRefs = refs
 		c.mu.Lock()
 		c.isLoaded = true
 		c.mu.Unlock()
 		s.Mu.Lock()
 		s.Events = events
-		s.FirstUserMsg = firstUser
+		if firstUser != "" {
+			s.FirstUserMsg = firstUser
+		}
 		s.Mu.Unlock()
 		_processEvents(responseSequence, true)
 	}
