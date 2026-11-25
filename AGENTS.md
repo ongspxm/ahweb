@@ -7,6 +7,10 @@
 review rules are included as docs/review-xxx.md
 they should roughly follow the trigger, invariant, verify, exception, severity structure
 
+when reviewing, list all the review rules mdfiles that you read in full.
+(so we know which review rules you used)
+list all violation in this format: violation area, reason, wut's next
+
 ## general code style
 - always keep code compact and ponytail (prefer reuse and inline by default)
 - dun write stupid test. only test real logic relevant to the project
