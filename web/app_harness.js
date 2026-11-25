@@ -57,8 +57,9 @@ function _openMermaidTab(source, diagram) {
 	promise.then((svg) => {
 		if (!svg || tab.closed) return tab.closed ? undefined : tab.close();
 		const dark = document.documentElement.dataset.theme === "dark";
-		const svgDoc = new DOMParser().parseFromString(svg, "image/svg+xml"),
-			root = svgDoc.documentElement;
+		const svgDoc = new DOMParser().parseFromString(svg, "text/html"),
+			root = svgDoc.querySelector("svg");
+		if (!root) return tab.close();
 		root.removeAttribute("width");
 		root.removeAttribute("height");
 		root.style.removeProperty("max-width");
@@ -66,7 +67,7 @@ function _openMermaidTab(source, diagram) {
 		root.style.removeProperty("height");
 		root.style.width = "100%";
 		root.style.height = "auto";
-		const scalableSVG = new XMLSerializer().serializeToString(root);
+		const scalableSVG = root.outerHTML;
 		const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mermaid diagram</title><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{font-family:system-ui,sans-serif;background:${dark ? "#11191f" : "#fff"};color:${dark ? "#cfd9e2" : "#111"}}#toolbar{position:fixed;z-index:1;display:flex;align-items:center;gap:.35rem;height:2.75rem;padding:.35rem .5rem;border-bottom:1px solid ${dark ? "#2d3a42" : "#ddd"};background:${dark ? "#11191f" : "#fff"}}#toolbar button{height:2rem;margin:0;padding:.25rem .6rem;width:auto;font:inherit;cursor:pointer}#toolbar button:disabled{cursor-not-allowed;opacity:.5}#status{min-width:3.5rem;font-size:.75rem;text-align:center}#stage{width:100%;height:100%;padding:3.35rem 1rem 1rem;overflow:auto;background:${dark ? "#11191f" : "#fff"}}#diagram{width:100%;min-height:100%}#diagram svg{display:block;width:100%;max-width:none;height:auto;margin:auto}</style></head><body><div id="toolbar"><button id="out" type="button" aria-label="Zoom out" title="Zoom out">−</button><button id="in" type="button" aria-label="Zoom in" title="Zoom in">+</button><button id="reset" type="button" aria-label="Reset zoom" title="Reset zoom">Reset</button><span id="status">100%</span></div><div id="stage"><div id="diagram">${scalableSVG}</div></div>		<script>let zoom=100;const diagram=document.getElementById("diagram"),status=document.getElementById("status"),out=document.getElementById("out"),inBtn=document.getElementById("in");function setZoom(next){zoom=Math.max(10,Math.min(500,next));diagram.style.width=zoom+"%";status.textContent=zoom+"%";out.disabled=zoom===10;inBtn.disabled=zoom===500}inBtn.onclick=()=>setZoom(zoom+10);out.onclick=()=>setZoom(zoom-10);document.getElementById("reset").onclick=()=>setZoom(100);window.addEventListener("load",()=>{try{URL.revokeObjectURL(location.href)}catch{}});setZoom(100);</script></body></html>`;
 		const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
 		tab.location.replace(url);
@@ -1515,9 +1516,7 @@ for (const [crumb, section] of [
 ])
 	crumb.addEventListener("click", () => {
 		location.hash = "#sess";
-		sideSections.forEach((item) => {
-			item.open = item === section;
-		});
+		for (const item of sideSections) item.open = item === section;
 	});
 eleRefresh.addEventListener("click", () => {
 	if (!sessid) return;
