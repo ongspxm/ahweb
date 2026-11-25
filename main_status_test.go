@@ -2,18 +2,46 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func TestCheckUpdateShouldReportDevBuild(t *testing.T) {
-	version, notice, failed := checkUpdateNotice()
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"Version":"v9.9.9"}`)),
+		}, nil
+	})}
+	version, latest, notice, failed := checkUpdateNotice(client)
 	if version != "(devel)" {
 		t.Skipf("test binary version = %q, want development build", version)
 	}
+	if latest != "v9.9.9" {
+		t.Fatalf("latest = %q, want v9.9.9", latest)
+	}
 	if notice != "" || !failed {
 		t.Fatalf("development build check = (%q, %t), want no notice and failure", notice, failed)
+	}
+}
+
+func TestCheckUpdateShouldReportLatestError(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network down")
+	})}
+	_, latest, notice, failed := checkUpdateNotice(client)
+	if latest != "(error)" {
+		t.Fatalf("latest = %q, want (error)", latest)
+	}
+	if notice != "" || !failed {
+		t.Fatalf("check = (%q, %t), want no notice and failure", notice, failed)
 	}
 }
 
@@ -24,12 +52,16 @@ func TestStatusAPIShouldIncludeUpdateCheckFields(t *testing.T) {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
 	}
 	var body struct {
+		Latest            string `json:"latest"`
 		UpdateCheckFailed *bool  `json:"update_check_failed"`
 		UpdateCommand     string `json:"update_command"`
 		Update            string `json:"update"`
 	}
 	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
+	}
+	if body.Latest == "" {
+		t.Fatal("response is missing latest")
 	}
 	if body.UpdateCheckFailed == nil {
 		t.Fatal("response is missing update_check_failed")

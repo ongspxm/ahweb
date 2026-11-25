@@ -7,10 +7,14 @@ function renderStatus(status) {
 	statusView.replaceChildren();
 	const version = document.createElement("p");
 	version.textContent = `Version: ${status.version || "unknown"}`;
+	version.append(
+		document.createElement("br"),
+		`Latest: ${status.latest || "(error)"}`,
+	);
 	const update = document.createElement("p"),
 		updateError =
 			status.version === "(devel)"
-				? "Update checks are unavailable for development builds."
+				? "Update availability cannot be determined for development builds."
 				: "Could not check for updates.";
 	update.textContent =
 		status.update ||

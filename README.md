@@ -33,9 +33,11 @@ Run `scripts/setup-githooks.sh` for automated checks.
 All fields required unless marked optional.
 - `GET /host` returns normalized instance name, used for identifying server.
 - `GET /api/status` returns server stats:
+  - `version`: running build version (`(devel)` for development builds).
+  - `latest`: latest published version, `(error)` if unavailable.
   - `update`: concise newer-release notice; empty when not outdated.
   - `update_command`: copyable full update command.
-  - `update_check_failed`: true if the check could not complete.
+  - `update_check_failed`: true if the update comparison could not complete.
 
 ### Config & models
 - `GET /api/config` returns all config as JSON; `GET /api/config?key=...` returns one value.
