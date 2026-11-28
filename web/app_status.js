@@ -23,11 +23,30 @@ function renderStatus(status) {
 			: `You’re up to date: version ${status.version || "unknown"}.`);
 	statusUpdate.hidden = !status.update;
 	statusView.append(version, update);
-	if (status.update && status.update_command) {
-		const command = document.createElement("pre");
+	if (status.update_command) {
+		const updateAction = document.createElement("div"),
+			command = document.createElement("pre"),
+			button = document.createElement("button");
 		command.className = "status-update-command";
 		command.textContent = status.update_command;
-		statusView.append(command);
+		button.type = "button";
+		button.textContent = "Upgrade ahweb";
+		button.addEventListener("click", async () => {
+			button.disabled = true;
+			try {
+				const response = await fetch("/api/update", { method: "POST" });
+				if (!response.ok) throw new Error("Could not start update");
+				window.setNotice(
+					"update",
+					"Update started. Ahweb may restart shortly.",
+				);
+			} catch (err) {
+				window.setNotice("error", err.message);
+				button.disabled = false;
+			}
+		});
+		updateAction.append(button);
+		statusView.append(command, updateAction);
 	}
 
 	const pollStatus = document.createElement("p");

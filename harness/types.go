@@ -26,6 +26,7 @@ type Event struct {
 	ToolFailed  bool      `json:"tool_failed,omitempty"`
 	TimestampMs int64     `json:"timestamp,omitempty"`
 	Model       string    `json:"model,omitempty"`
+	Reasoning   string    `json:"reasoning,omitempty"`
 	RewindID    string    `json:"rewind_id,omitempty"`
 
 	// in tool_start this should include the "params" that the tool is called with
@@ -46,6 +47,7 @@ type SessionLite struct {
 	FirstUserMsg    string
 	LastTimestampMs int64
 	ParentSessID    string
+	ReadOnly        bool
 }
 type Session struct {
 	SessionLite
@@ -101,16 +103,19 @@ func (s *Session) GetStatsMapLocked() map[string]any {
 
 // === then Adapter
 type Adapter interface {
-	// Ready checks service availability before the adapter is registered.
+	// Adpater level fns
 	Ready() error
+	CanSteer(haveImg bool) bool
+	CanDelete() bool
+	GetModels() (map[string]Model, error)
+	ListSessions(realFolder string) ([]SessionLite, error)
+
 	// Connect() should be cheap if already connected
 	// Connect() should work for creating new sessions as well
 	Connect(s *Session, doForceReconnect bool) error
-	GetModels() (map[string]Model, error)
-	ListSessions(realFolder string) ([]SessionLite, error)
-	CanDelete() bool
 	Delete(*Session) error
 	SendPrompt(s *Session) error
+
 	// Poll() refreshes the first user message, stats, events, and other state.
 	// Poll() should (if possible) do partial msg read, unless s.DoFullHistory=true, then do full read
 	Poll(s *Session) error
@@ -136,6 +141,7 @@ func (DefaultAdapter) ListSessions(string) ([]SessionLite, error) {
 func (DefaultAdapter) SendPrompt(*Session) error {
 	return errors.New("DefaultAdapter.SendPrompt is not implemented")
 }
+func (DefaultAdapter) CanSteer(bool) bool { return false }
 func (DefaultAdapter) Poll(*Session) error {
 	return errors.New("DefaultAdapter.Poll is not implemented")
 }
@@ -180,3 +186,6 @@ func DataURI(mimeType, data string) string {
 	}
 	return "data:" + mimeType + ";base64," + data
 }
+
+// === err types
+var ErrPromptRejected = errors.New("session rejected prompt")

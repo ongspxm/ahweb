@@ -43,10 +43,10 @@ func TestEventsHandlerWaitsForFullHistoryPoll(t *testing.T) {
 
 	pollDone := make(chan struct{})
 	go func() {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		a.pollSession(pollJob{session: s, done: &wg})
-		wg.Wait()
+		var pollJobsDone sync.WaitGroup
+		pollJobsDone.Add(1)
+		a.pollSession(pollJob{session: s, pollJobsDone: &pollJobsDone})
+		pollJobsDone.Wait()
 		close(pollDone)
 	}()
 	select {

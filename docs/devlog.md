@@ -5,7 +5,7 @@ entries should roughly be along the lines of:
 - roughly wut the shape of the change look like in each of api/webui
 
 okay to split multiline, one point one line. (look at past entry for eg)
-states: TODO for new, DONE for completed, PARK for in the future. REJECT for dun fix.
+states: TODO for new, DONE for completed, PARK for putting the entry on hold. REJECT for dun fix.
 ORDER: older entries at the bottom
 
 migration means we use a clean devlog.md will all these frontmatter copied over
@@ -15,19 +15,101 @@ NOTE: when migrating, we move over the TODO and PARK notes (MOVE not COPY)
 potential backlog:
 - fork
 
-todos:
-- copilot harness, the assistant message not populating the model + effort
+## 2026-11-28 DONE. Claude and Cursor child sessions
+why. Both CLIs can spawn child agents, but ahweb lists and polls only parent transcripts.
+probe. Cursor Agent 2026.11.22-e9042b2 and Claude Code 2.1.332 each spawned a child and returned CHILD_PROBE_OK. Cursor stores child transcripts under `~/.cursor/projects/<project>/agent-transcripts/<parent-id>/subagents/<agent-id>.jsonl`. Claude stores them under `~/.claude/projects/<project>/<parent-id>/subagents/agent-<agent-id>.jsonl`, with a matching `.meta.json`. Parent output provides child ID.
+api. List children as read-only sessions with ParentSessID. Read child events from nested transcripts; keep parent start/end events.
+verify. `go test ./...`, `go build ./...`; side-port API check: both children listed with correct parent IDs, `/api/events` returned child history, and listing/events persisted after restart.
+
+## 2026-11-27 DONE. adapters populate event model and reasoning
+why. assistant and thinking events often lacked model and reasoning metadata, hiding which model and reasoning level produced each entry.
+change. adapters populate source model IDs and available reasoning metadata on assistant/thinking events in live output and saved history. Model IDs match GetModels(); Copilot carries model/reasoning selection changes into events. Event field is `reasoning`, not `effort`; webui reads `event.reasoning`.
+verify. `go test ./...` passes. Side-port API check for new and historical sessions remains unrun.
+
+## 2026-11-28 DONE. webui save model defaults
+why. Empty or stale model default makes user pick same working model again.
+change. Warn when saved model or reasoning is missing. Save picked model+reasoning as defaults after prompt succeeds. Keep sent choices shown while chat is busy.
+verify. `go test ./...`, `go build ./...`, `node --check`; mocked Chrome flow green. `git diff --check` green.
+
+## 2026-11-28 DONE. route mid-run steering through SendPrompt
+why. One input path for normal prompts and active-run steering.
+change. `/api/prompt` queues all input. Poll sends queued input while `BusyCli=true` only when `Adapter.CanSteer(haveImg)` allows it; otherwise, input waits until `BusyCli=false`. Capable adapters steer inside `SendPrompt()` based on `Session.BusyCli`.
+limit. Prime steers text while busy; image prompts wait until idle, then send normally. Copilot waits until current task ends. Claude and Cursor do not advertise steering.
+verify. `go test ./...` and `go build ./...` pass.
+
+## 2026-11-27 DONE. copilot stop leaves native process running
+obs: POST /api/stop returns busy=false, but immediate GET /api/events?start_from=-1 can return busy=true; Copilot can finish one tool call and start another after stop.
+dig: adapters/copilot/adapter.go Stop() kills cmd.Process, the Node launcher; its native Copilot child survives, keeps stdout open, and emits more events. Poll then restores busy=true.
+fix: stop launcher and child as one process tree, then wait for stdout reader to finish before clearing busy state.
+
+## 2026-11-27 DONE. copilot usage and cost go missing
+obs: Copilot chats sometimes show 0 tokens and $0, while transcript has usage records.
+dig: Poll() reads totals from SQLite only. It skips session.usage_record and session.usage_checkpoint in events.jsonl. Repro: 3 chats had log usage but no DB rows; Poll() gave 0s.
+fix: Read tokens from usage_record and cost from usage_checkpoint. Use SQLite if log has no usage.
+verify: A ~3.5-minute Copilot review task returned 465482 input tokens, 15448 output tokens, and $0.80692 from GET /api/events?start_from=-1.
+
+## 2026-11-26 DONE. Codex detailed reasoning summaries
+why. Codex rollout reasoning items default to empty summary -> ahweb shows blank thinking events.
+change. adapters/codex/adapter.go sets config.model_reasoning_summary=detailed on thread/start -> existing parser maps summary text to EventThinking. Uses shared daemon; no per-session CLI process.
+verify. go test ./... pass. Ran ahweb on branch feat-codex-reasoning-summary (.wt-featcodexreasoningsummary), sent POST /api/prompt harness=codex, polled GET /api/events -> got thinking event "**Parsing the color clues**".
+
+## 2026-11-26 DONE. ADAPTER-005 Claude thinking, tool results, and Prime errors
+why. real transcripts hold supported data -> adapters drop it silently.
+1. Claude thinking DONE: adapters/claude/adapter.go reads thinking on transcript blocks and keeps it as EventThinking content.
+2. DONE. Claude tool results: saved-history tool_result mapping now maps result text and images into EventToolEnd.
+3. DONE. Prime errors: adapters/prime/adapter.go maps errorMessage to error events when assistant content is empty.
+api. fix adapter event mapping only; no endpoint or webui changes.
+checks. compare mapped events against real transcript samples; confirm thinking, tool results, errors survive full-history reload. Run go test ./....
+
+## 2026-11-26 PARK. Darwin startup force_perms
+why. harness file access triggers macOS prompts later -> trigger expected prompts at startup without launching harnesses.
+shape. main.go owns force_perms; run once at server startup after CLI command handling, before adapters start. Darwin only; no adapter, API, webui changes, or saved done flag.
+probe. fixed small list of existing Photos/Music library paths + known protected app-data paths. Open dir, read <=1 entry, close. No random scan, file read, write, or recursive walk; skip missing paths.
+errors. log denied/unexpected errors and continue; probe failure must not kill server. System prompts may wait for user.
+gate. test read-only probes first on macOS from same installed ahweb binary + launch context. Paths and TCC attribution vary -> prompts best-effort, not guaranteed. Pick real protected library paths, not just Pictures/Music parent folders.
+checks. verify fresh prompts, allow/deny, later harness access, repeat startup, missing paths, Linux no-op. Run go test ./... and go build ./...; review docs/review-api-gocode-architecture.md before edits.
+next. hold until user resumes; then confirm paths and real macOS results before coding. No cgo bridge, harness warmup, or Full Disk Access workaround.
+
+## 2026-11-26 DONE. webui sync model and thinking on chat open
+why. reopening existing chat should restore last session model and thinking effort instead of resetting to global defaults.
+webui. use latest assistant or thinking event model + effort on chat open and after initial events load; fall back to configured defaults when event fields are absent.
+defaults. add explicit Save defaults button for current model + reasoning; persist both settings only on click.
+
+## 2026-11-26 DONE. copilot adapter thinking entries
+now. copilot chats miss thinking blocks in webui.
+dig. events.jsonl stores reasoning in assistant.message data.reasoningText; live stdout emits assistant.message with reasoningText before assistant.reasoning. parseJsonToEvent ignored reasoningText and returned single event.
+api. change parseJsonToEvent in adapters/copilot/adapter.go -> return []harness.Event, emit harness.EventThinking from assistant.message data.reasoningText before EventAssistant.
+
+## 2026-11-26 DONE. prime adapter assistant errors
+Prime assistant error messages were missing from session events.
+api. Parse errorMessage from saved assistant messages and emit EventError before assistant content.
+
+## 2026-11-26 DONE. Status tab upgrade command
+why. upgrade command should be runnable from Status even when ahweb up to date.
+webui. always show command and Upgrade ahweb button; POST /api/update runs fixed command in background.
+
+## 2026-11-26 DONE. webui copy assistant and tool content
+assistant messages and tool output should be copyable, like user messages
+webui. add copy buttons to assistant cards and tool details, using same button style as user messages
+
+## 2026-11-26 DONE. webui auto-close notices
+notice-area entries currently stay open until replaced or dismissed by hand
+webui. auto-close every notice after 10 seconds, including errors
 
 ## 2026-11-25 DONE. webui Mermaid popup parser
 mermaid SVG has HTML inside foreignObject, like br tags, so strict XML parsing breaks the popup.
 webui. parse mermaid output as text/html instead of text/svg
 
-## 2026-11-23 TODO. copilot adapter, impl child session
-copliot harness, impl child session
+## 2026-11-28 DONE. copilot adapter child sessions
+Copilot subagents now list under parent sessions. `agentId` scopes live and historical events and usage; child sessions are read-only and share the parent's event log.
 
-## 2026-11-23 TODO. adapter child sessions
+verify: `go test ./...`, `go build ./...`, and side-port API check. Parent and child sessions listed with the right parent ID; each returned its own event history. Compact-ID prompt created and cleaned up test session.
+
+## 2026-11-28 DONE. adapter child sessions
 Codex subagents should appear as separate child sessions under the parent.
 But now all the messages and tool calls lump under the parent session
+
+Codex child threads now appear as separate read-only sessions with their own events. Parent session keeps subagent start and end events. Verified through API with two child sessions.
 
 Adapter needs to take child harnessID and init a session from that
 Live events and historical poll should pipe the msgs to child session, not parent

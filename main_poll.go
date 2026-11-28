@@ -13,19 +13,16 @@ import (
 )
 
 type pollJob struct {
-	session *harness.Session
-	done    *sync.WaitGroup
+	// pattern: xxxResult chan pass back err from adapter fns to endpoint handler
+	// pollJobsDone tracks completion for a job or poll cycle.
+	pollJobsDone *sync.WaitGroup
+	session      *harness.Session
 
-	// xxxResult != nil means that the poll job is for delete/rewind
-	// done is for completion, xxxResult is for err + job identification
+	deleteResult        chan error
+	deletePreviewTstamp int64
 
-	// deleteLast is tstamp of preview for us to match preview tstamp and sess tstamp
-	deleteResult chan error
-	deleteLast   int64
-
-	// rewindID is the id of the msg we want to rewind up till
-	rewindResult chan error
-	rewindID     string
+	rewindResult      chan error
+	rewindTargetMsgID string
 }
 
 func (a *app) pollLoop() {
@@ -42,11 +39,10 @@ func (a *app) pollLoop() {
 }
 
 func (a *app) pollSession(job pollJob) {
-	defer job.done.Done()
+	defer job.pollJobsDone.Done()
 	s := job.session
 	s.OpMu.Lock()
 	defer s.OpMu.Unlock()
-
 	// perform delete
 	if job.deleteResult != nil {
 		var err error
@@ -59,7 +55,7 @@ func (a *app) pollSession(job pollJob) {
 			err = errors.New("session is stopping")
 		} else if s.GetIsBusyLocked() {
 			err = errors.New("cannot delete a busy session")
-		} else if s.LastTimestampMs != job.deleteLast {
+		} else if s.LastTimestampMs != job.deletePreviewTstamp {
 			err = errors.New("session changed since preview")
 		} else {
 			s.IsDeleting = true
@@ -98,7 +94,7 @@ func (a *app) pollSession(job pollJob) {
 		if adp == nil {
 			err = errors.New("session adapter is unavailable")
 		} else if err = adp.Connect(s, false); err == nil {
-			err = adp.Rewind(s, job.rewindID)
+			err = adp.Rewind(s, job.rewindTargetMsgID)
 		}
 
 		if err != nil {
@@ -205,12 +201,12 @@ func (a *app) pollSession(job pollJob) {
 		s.IsRewinding = false
 		s.BusyMsg = false
 	}
-	busy, queued := s.BusyMsg || s.BusyCli, s.QueuedMsg != ""
+	busyCli, queued, haveImg := s.BusyCli, s.QueuedMsg != "", len(s.QueuedImages) > 0
 	s.Mu.Unlock()
 	if job.rewindResult != nil {
 		job.rewindResult <- pollErr
 	}
-	if queued && !busy {
+	if queued && (!busyCli || adp.CanSteer(haveImg)) {
 		a.sendQueued(s, adp)
 	}
 }
@@ -218,24 +214,28 @@ func (a *app) pollSession(job pollJob) {
 func (a *app) sendQueued(s *harness.Session, adp harness.Adapter) {
 	s.Mu.Lock()
 	msg, imgs := s.QueuedMsg, s.QueuedImages
-	// Keep the session busy while the prompt is being sent.
+	wasBusyCli := s.BusyCli
 	s.QueuedMsg, s.QueuedImages = "", nil
 	s.SendingMsg, s.SendingImages = msg, imgs
-	s.BusyCli = true
 	s.Mu.Unlock()
 
 	if err := adp.SendPrompt(s); err != nil {
 		log.Printf("adapter.send_prompt(%s, %s) failed: %v", s.Harness, s.ID, err)
 		s.Mu.Lock()
-		if s.QueuedMsg != "" && msg != "" {
-			msg += "\n"
-		}
-		s.QueuedMsg = msg + s.QueuedMsg
-		if imgs != nil {
-			s.QueuedImages = append(imgs, s.QueuedImages...)
+		if errors.Is(err, harness.ErrPromptRejected) {
+			s.NeedsFirstPrompt = false
+			s.Events = append(s.Events, harness.Event{Type: harness.EventError, Content: err.Error(), TimestampMs: time.Now().UnixMilli()})
+		} else {
+			if s.QueuedMsg != "" && msg != "" {
+				msg += "\n"
+			}
+			s.QueuedMsg = msg + s.QueuedMsg
+			if imgs != nil {
+				s.QueuedImages = append(imgs, s.QueuedImages...)
+			}
 		}
 		s.SendingMsg, s.SendingImages = "", nil
-		s.BusyCli = false
+		s.BusyCli = wasBusyCli
 		s.Mu.Unlock()
 		return
 	}
@@ -382,12 +382,12 @@ func (a *app) cleanupLoop() {
 			log.Printf("%s", line)
 		}
 
-		var done sync.WaitGroup
+		var pollJobsDone sync.WaitGroup
 		for _, s := range sessions {
-			done.Add(1)
-			a.pollJobs <- pollJob{session: s, done: &done}
+			pollJobsDone.Add(1)
+			a.pollJobs <- pollJob{session: s, pollJobsDone: &pollJobsDone}
 		}
-		done.Wait()
+		pollJobsDone.Wait()
 
 		// Clean up in a second loop because it blocks; cleaned prevents repeated calls.
 		for _, s := range cleanupSessions {

@@ -402,14 +402,19 @@ func (a *Adapter) Delete(s *harness.Session) error {
 // === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	model, variant, prompt, busy := s.PromptModel, s.PromptReasoning, s.SendingMsg, s.BusyCli
+	images := append([]string(nil), s.SendingImages...)
+	s.BusyCli = true
+	s.Mu.Unlock()
+	query := url.Values(nil)
+	if busy {
+		model, variant, query = nil, "", url.Values{"delivery": {"steer"}}
+	}
 	conn, err := a.conn(s)
 	if err != nil {
 		return err
 	}
-	s.Mu.Lock()
-	model, variant, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
-	images := append([]string(nil), s.SendingImages...)
-	s.Mu.Unlock()
 	body := map[string]any{"text": prompt}
 	if len(images) > 0 {
 		files := make([]map[string]string, 0, len(images))
@@ -434,14 +439,13 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			return err
 		}
 	}
-	if err := conn.call(http.MethodPost, "/prompt", nil, body, nil); err != nil {
+	if err := conn.call(http.MethodPost, "/prompt", query, body, nil); err != nil {
 		return err
 	}
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
 	return nil
 }
+
+func (*Adapter) CanSteer(bool) bool { return true }
 
 func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
 	conn, err := a.conn(s)

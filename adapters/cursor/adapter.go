@@ -16,11 +16,21 @@ import (
 	"time"
 
 	"github.com/ongspxm/ahweb/harness"
+	"github.com/ongspxm/ahweb/internal/processgroup"
 )
 
 // === adapter admin fns
 
-type Adapter struct{ harness.DefaultAdapter }
+type Adapter struct {
+	harness.DefaultAdapter
+
+	// cursor have modelID and modelName and for some reason
+	// it only returns the modelName in the stream-json
+	// but we need the modelID to submit msgs
+	// so this maps both modelID and modelName to modelID
+	modelIDsMu sync.RWMutex
+	modelIDs   map[string]string
+}
 
 func (*Adapter) Ready() error { _, err := exec.LookPath("cursor-agent"); return err }
 
@@ -29,6 +39,7 @@ type conn struct {
 	stderr       bytes.Buffer
 	events       []harness.Event
 	harnessID    string
+	parentID     string
 	isStopped    bool
 	isClosing    bool
 	processDone  chan struct{}
@@ -47,7 +58,7 @@ var (
 	sessIDToHarnessID = make(map[string]map[string]string)
 )
 
-func (*Adapter) GetModels() (map[string]harness.Model, error) {
+func (a *Adapter) GetModels() (map[string]harness.Model, error) {
 	cmd := exec.Command("cursor-agent", "--list-models")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -59,18 +70,44 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 		return nil, fmt.Errorf("could not list Cursor models: %w", err)
 	}
 	models := make(map[string]harness.Model)
+	modelIDs := make(map[string]string)
+	ambiguousNames := make(map[string]bool)
+	_addModelName := func(name, id string) {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" || ambiguousNames[name] {
+			return
+		}
+		if previous := modelIDs[name]; previous != "" && previous != id {
+			delete(modelIDs, name)
+			ambiguousNames[name] = true
+			return
+		}
+		modelIDs[name] = id
+	}
 	for _, line := range strings.Split(string(output), "\n") {
-		id, _, ok := strings.Cut(strings.TrimSpace(line), " - ")
+		id, name, ok := strings.Cut(strings.TrimSpace(line), " - ")
 		if !ok || id == "" {
 			continue
 		}
-		id = "cursor/" + id
 		models[id] = harness.Model{Harness: "cursor", ID: id}
+		_addModelName(id, id)
+		_addModelName(name, id)
 	}
 	if len(models) == 0 {
 		return nil, errors.New("Cursor Agent returned no models")
 	}
+	a.modelIDsMu.Lock()
+	a.modelIDs = modelIDs
+	a.modelIDsMu.Unlock()
 	return models, nil
+}
+
+func (a *Adapter) _modelID(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	a.modelIDsMu.RLock()
+	id := a.modelIDs[model]
+	a.modelIDsMu.RUnlock()
+	return id
 }
 
 func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
@@ -83,20 +120,15 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		return nil, fmt.Errorf("could not read Cursor sessions: %w", err)
 	}
 	var sessions []harness.SessionLite
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		harnessID := entry.Name()
-		path := filepath.Join(root, harnessID, harnessID+".jsonl")
+	_read := func(harnessID, path, parentID string) string {
 		file, err := os.Open(path)
 		if err != nil {
-			continue
+			return ""
 		}
 		info, err := file.Stat()
 		if err != nil {
 			_ = file.Close()
-			continue
+			return ""
 		}
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
@@ -135,7 +167,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		scanErr := scanner.Err()
 		_ = file.Close()
 		if scanErr != nil || !hasText {
-			continue
+			return ""
 		}
 
 		// A session created in this run has a local ID; do not list its chat twice.
@@ -145,8 +177,30 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 			sessID = mappedID
 		}
 		cacheMu.Unlock()
-		lite := harness.SessionLite{ID: sessID, RealPath: realFolder, Harness: "cursor", FirstUserMsg: first, LastTimestampMs: info.ModTime().UnixMilli()}
-		sessions = append(sessions, lite)
+		sessions = append(sessions, harness.SessionLite{ID: sessID, RealPath: realFolder, Harness: "cursor", FirstUserMsg: first, LastTimestampMs: info.ModTime().UnixMilli(), ParentSessID: parentID, ReadOnly: parentID != ""})
+		return sessID
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		harnessID := entry.Name()
+		path := filepath.Join(root, harnessID, harnessID+".jsonl")
+		parentID := _read(harnessID, path, "")
+		if parentID == "" {
+			continue
+		}
+		children, err := os.ReadDir(filepath.Join(root, harnessID, "subagents"))
+		if err != nil {
+			continue
+		}
+		for _, child := range children {
+			if child.IsDir() || filepath.Ext(child.Name()) != ".jsonl" {
+				continue
+			}
+			childID := strings.TrimSuffix(child.Name(), ".jsonl")
+			_read(childID, filepath.Join(root, harnessID, "subagents", child.Name()), parentID)
+		}
 	}
 	return sessions, nil
 }
@@ -170,10 +224,18 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	}
 	if cache[s.RealPath][s.ID] == nil {
 		harnessID := sessionUUID(s.ID)
-		if _, err := os.Stat(transcriptPath(s.RealPath, harnessID)); err != nil {
+		parentID := sessionUUID(s.ParentSessID)
+		path := transcriptPath(s.RealPath, harnessID)
+		if s.ParentSessID != "" {
+			if mappedID := sessIDToHarnessID[s.RealPath][s.ParentSessID]; mappedID != "" {
+				parentID = mappedID
+			}
+			path = childTranscriptPath(s.RealPath, parentID, harnessID)
+		}
+		if _, err := os.Stat(path); err != nil {
 			harnessID = ""
 		}
-		cache[s.RealPath][s.ID] = &conn{events: append([]harness.Event(nil), s.Events...), harnessID: harnessID}
+		cache[s.RealPath][s.ID] = &conn{events: append([]harness.Event(nil), s.Events...), harnessID: harnessID, parentID: parentID}
 		if harnessID != "" {
 			harnessIDToSessID[s.RealPath][harnessID] = s.ID
 			sessIDToHarnessID[s.RealPath][s.ID] = harnessID
@@ -192,11 +254,11 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 	c.mu.Lock()
 	c.isClosing = true
 	cmd, done := c.cmd, c.processDone
-	if cmd != nil && cmd.Process != nil {
+	if cmd != nil {
 		c.isStopped = true
-		_ = cmd.Process.Kill()
 	}
 	c.mu.Unlock()
+	_ = processgroup.Kill(cmd)
 	if done != nil {
 		<-done
 	}
@@ -214,13 +276,18 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 // === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	prompt, userPrompt, images, model := s.SendingMsg, s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel
+	s.BusyCli = true
+	s.Mu.Unlock()
 	c, err := a.conn(s)
 	if err != nil {
 		return err
 	}
-	s.Mu.Lock()
-	prompt, userPrompt, images, model := s.SendingMsg, s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel
-	s.Mu.Unlock()
+	liveModel := ""
+	if model != nil {
+		liveModel = model.ID
+	}
 	var imageFiles []string
 	keepImages := false
 	defer func() {
@@ -265,7 +332,7 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		args = append(args, "--resume", c.harnessID)
 	}
 	if model != nil && model.ID != "" {
-		args = append(args, "--model", strings.TrimPrefix(model.ID, "cursor/"))
+		args = append(args, "--model", model.ID)
 	}
 	args = append(args, prompt)
 	cmd := exec.Command("cursor-agent", args...)
@@ -276,24 +343,23 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	}
 	c.stderr.Reset()
 	cmd.Stderr = &c.stderr
-	if err := cmd.Start(); err != nil {
+	if err := processgroup.Start(cmd); err != nil {
 		return fmt.Errorf("could not start Cursor Agent: %w", err)
 	}
 	keepImages = true
 	done := make(chan struct{})
 	c.cmd, c.isStopped, c.processDone = cmd, false, done
 	c.events = append(c.events, harness.Event{Type: harness.EventUser, Content: userPrompt, Images: images, TimestampMs: time.Now().UnixMilli()})
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
 
 	// process the stdout form the cmd call
 	go func() {
+		defer close(done)
 		defer func() {
 			for _, path := range imageFiles {
 				_ = os.Remove(path)
 			}
 		}()
+		currentModel := liveModel
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 		for scanner.Scan() {
@@ -305,6 +371,9 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			_add := func(event harness.Event) {
 				event.TimestampMs = time.Now().UnixMilli()
 				c.mu.Lock()
+				if (event.Type == harness.EventAssistant || event.Type == harness.EventThinking) && event.Model == "" {
+					event.Model = currentModel
+				}
 				c.events = append(c.events, event)
 				c.mu.Unlock()
 			}
@@ -322,7 +391,13 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			switch kind {
 			case "system":
 				if subtype, _ := msg["subtype"].(string); subtype == "init" {
-					if harnessID, _ := msg["session_id"].(string); harnessID != "" {
+					model, _ := msg["model"].(string)
+					harnessID, _ := msg["session_id"].(string)
+					modelID := a._modelID(model)
+					if modelID != "" {
+						currentModel = modelID
+					}
+					if harnessID != "" {
 						c.mu.Lock()
 						c.harnessID = harnessID
 						c.mu.Unlock()
@@ -335,10 +410,21 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 			case "user":
 				continue
 			case "assistant":
+				model, _ := msg["model"].(string)
+				reasoning, _ := msg["effort"].(string)
+				if model == "" {
+					if message, ok := msg["message"].(map[string]any); ok {
+						model, _ = message["model"].(string)
+						if reasoning == "" {
+							reasoning, _ = message["effort"].(string)
+						}
+					}
+				}
+				model = a._modelID(model)
 				message, _ := msg["message"].(map[string]any)
 				for _, part := range contentParts(message["content"]) {
 					if text, _ := part["text"].(string); text != "" {
-						_add(harness.Event{Type: harness.EventAssistant, Content: text})
+						_add(harness.Event{Type: harness.EventAssistant, Content: text, Model: model, Reasoning: reasoning})
 					}
 				}
 			case "tool_call":
@@ -437,7 +523,6 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		}
 		c.cmd = nil
 		c.mu.Unlock()
-		close(done)
 	}()
 	return nil
 }
@@ -452,24 +537,60 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.Mu.Unlock()
 	c.mu.Lock()
 	harnessID := c.harnessID
+	parentID := c.parentID
 
 	// full session reading if cursor sess exist
 	if fullHistory && harnessID != "" {
-		file, err := os.Open(transcriptPath(s.RealPath, harnessID))
+		path := transcriptPath(s.RealPath, harnessID)
+		if s.ParentSessID != "" {
+			path = childTranscriptPath(s.RealPath, parentID, harnessID)
+		}
+		file, err := os.Open(path)
 		if err == nil {
 			if info, err := file.Stat(); err == nil {
 				stamp := info.ModTime().UnixMilli()
 				var events []harness.Event
+				currentModel, currentReasoning := "", ""
 				scanner := bufio.NewScanner(file)
 				scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 				for scanner.Scan() {
 					var row struct {
-						Role    string `json:"role"`
+						Type    string         `json:"type"`
+						Role    string         `json:"role"`
+						Model   string         `json:"model"`
+						Effort  string         `json:"effort"`
+						Data    map[string]any `json:"data"`
 						Message struct {
-							Content any `json:"content"`
+							Content any    `json:"content"`
+							Model   string `json:"model"`
+							Effort  string `json:"effort"`
 						} `json:"message"`
 					}
 					if json.Unmarshal(scanner.Bytes(), &row) != nil {
+						continue
+					}
+					model := row.Model
+					if model == "" {
+						model, _ = row.Data["model"].(string)
+					}
+					if model == "" {
+						model = row.Message.Model
+					}
+					model = a._modelID(model)
+					reasoning := row.Effort
+					if reasoning == "" {
+						reasoning, _ = row.Data["effort"].(string)
+					}
+					if reasoning == "" {
+						reasoning = row.Message.Effort
+					}
+					if row.Type == "system" || row.Role == "system" {
+						if model != "" {
+							currentModel = model
+						}
+						if reasoning != "" {
+							currentReasoning = reasoning
+						}
 						continue
 					}
 					typ := harness.EventAssistant
@@ -477,6 +598,22 @@ func (a *Adapter) Poll(s *harness.Session) error {
 						typ = harness.EventUser
 					} else if row.Role != "assistant" {
 						continue
+					}
+					if model == "" {
+						model = currentModel
+					}
+					if reasoning == "" {
+						reasoning = currentReasoning
+					}
+					if typ != harness.EventAssistant {
+						model, reasoning = "", ""
+					} else {
+						if model != "" {
+							currentModel = model
+						}
+						if reasoning != "" {
+							currentReasoning = reasoning
+						}
 					}
 
 					// Saved tool calls have name and input but no result or call ID, so replay only the start.
@@ -499,7 +636,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 								}
 								text = strings.TrimSpace(text)
 							}
-							events = append(events, harness.Event{Type: typ, Content: text, TimestampMs: stamp})
+							events = append(events, harness.Event{Type: typ, Content: text, TimestampMs: stamp, Model: model, Reasoning: reasoning})
 						}
 					}
 				}
@@ -541,14 +678,16 @@ func (a *Adapter) Stop(s *harness.Session) error {
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cmd == nil {
+	cmd, done := c.cmd, c.processDone
+	if cmd == nil {
+		c.mu.Unlock()
 		return nil
 	}
-	if err := c.cmd.Process.Signal(os.Interrupt); err != nil {
-		return fmt.Errorf("could not interrupt Cursor Agent: %w", err)
-	}
 	c.isStopped = true
+	c.mu.Unlock()
+	if err := processgroup.Stop(cmd, done, time.Second); err != nil {
+		return fmt.Errorf("could not stop Cursor Agent: %w", err)
+	}
 	return nil
 }
 
@@ -588,6 +727,10 @@ func transcriptPath(realPath, harnessID string) string {
 		return root
 	}
 	return filepath.Join(root, harnessID, harnessID+".jsonl")
+}
+
+func childTranscriptPath(realPath, parentID, childID string) string {
+	return filepath.Join(transcriptPath(realPath, ""), parentID, "subagents", childID+".jsonl")
 }
 
 func contentParts(content any) []map[string]any {

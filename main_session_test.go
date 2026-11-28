@@ -45,7 +45,7 @@ func TestPromptHandlerAppendsNewPromptToExistingQueue(t *testing.T) {
 func TestEventsHandlerReportsBusyWhenPromptIsQueued(t *testing.T) {
 	folder := t.TempDir()
 	s := &harness.Session{SessionLite: harness.SessionLite{ID: "session", RealPath: folder, Harness: "pi"}, QueuedMsg: "waiting"}
-	a := &app{sessions: map[string]map[sessionKey]*harness.Session{folder: {{harness: s.Harness, id: s.ID}: s}}}
+	a := &app{adapters: map[string]harness.Adapter{"pi": harness.DefaultAdapter{}}, sessions: map[string]map[sessionKey]*harness.Session{folder: {{harness: s.Harness, id: s.ID}: s}}}
 	a.lastOpened.times = make(map[string]map[string]int64)
 	q := url.Values{"folder": {folder}, "sessid": {s.ID}, "harness": {s.Harness}}
 	res := testRequest(a.handleEvents, http.MethodGet, "/api/events?"+q.Encode(), "")
@@ -106,7 +106,7 @@ func (queueFailureAdapter) SendPrompt(s *harness.Session) error {
 }
 
 func TestSendQueuedRestoresQueuedMessagesAndImagesAfterFailure(t *testing.T) {
-	s := &harness.Session{SessionLite: harness.SessionLite{Harness: "pi"}, QueuedMsg: "original", QueuedImages: []string{"original-image"}}
+	s := &harness.Session{SessionLite: harness.SessionLite{Harness: "pi"}, BusyCli: true, QueuedMsg: "original", QueuedImages: []string{"original-image"}}
 	(&app{}).sendQueued(s, queueFailureAdapter{})
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -116,8 +116,54 @@ func TestSendQueuedRestoresQueuedMessagesAndImagesAfterFailure(t *testing.T) {
 	if got := strings.Join(s.QueuedImages, ","); got != "original-image,later-image" {
 		t.Fatalf("queued images = %q, want original-image,later-image", got)
 	}
-	if s.BusyCli || s.SendingMsg != "" || len(s.SendingImages) != 0 {
-		t.Fatalf("send state not cleared after failure: busy=%v sending=%q images=%v", s.BusyCli, s.SendingMsg, s.SendingImages)
+	if !s.BusyCli || s.SendingMsg != "" || len(s.SendingImages) != 0 {
+		t.Fatalf("send state not restored after failure: busy=%v sending=%q images=%v", s.BusyCli, s.SendingMsg, s.SendingImages)
+	}
+}
+
+type promptRejectedAdapter struct{ harness.DefaultAdapter }
+
+func (promptRejectedAdapter) SendPrompt(*harness.Session) error {
+	return errors.Join(harness.ErrPromptRejected, errors.New("direct input disallowed"))
+}
+
+type promptRejectedWithQueuedAdapter struct{ harness.DefaultAdapter }
+
+func (promptRejectedWithQueuedAdapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	s.QueuedMsg, s.QueuedImages = "later", []string{"later-image"}
+	s.Mu.Unlock()
+	return errors.Join(harness.ErrPromptRejected, errors.New("steer input rejected"))
+}
+
+func TestIfPromptRejectedShouldDropQueueAndErr(t *testing.T) {
+	s := &harness.Session{
+		SessionLite:      harness.SessionLite{Harness: "codex"},
+		NeedsFirstPrompt: true,
+		QueuedMsg:        "hello",
+		QueuedImages:     []string{"img"},
+	}
+	(&app{}).sendQueued(s, promptRejectedAdapter{})
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if s.QueuedMsg != "" || len(s.QueuedImages) != 0 || s.SendingMsg != "" || len(s.SendingImages) != 0 || s.BusyCli || s.NeedsFirstPrompt {
+		t.Fatalf("rejected prompt left dirty state: queued=%q images=%v sending=%q busy=%v first=%v", s.QueuedMsg, s.QueuedImages, s.SendingMsg, s.BusyCli, s.NeedsFirstPrompt)
+	}
+	if len(s.Events) != 1 || s.Events[0].Type != harness.EventError || !strings.Contains(s.Events[0].Content, "direct input disallowed") {
+		t.Fatalf("events = %+v, want one error event", s.Events)
+	}
+}
+
+func TestRejectedPromptShouldKeepLaterQueue(t *testing.T) {
+	s := &harness.Session{SessionLite: harness.SessionLite{Harness: "prime"}, BusyCli: true, QueuedMsg: "reject this", QueuedImages: []string{"rejected-image"}}
+	(&app{}).sendQueued(s, promptRejectedWithQueuedAdapter{})
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if s.QueuedMsg != "later" || strings.Join(s.QueuedImages, ",") != "later-image" {
+		t.Fatalf("later queue = %q %v, want later prompt and image", s.QueuedMsg, s.QueuedImages)
+	}
+	if !s.BusyCli || s.SendingMsg != "" || len(s.SendingImages) != 0 {
+		t.Fatalf("send state not restored: busy=%v sending=%q images=%v", s.BusyCli, s.SendingMsg, s.SendingImages)
 	}
 }
 
@@ -142,6 +188,26 @@ func TestSessionHandlersRejectRequestsMissingHarness(t *testing.T) {
 				t.Fatalf("status = %d, want %d: %s", res.Code, http.StatusBadRequest, res.Body.String())
 			}
 		})
+	}
+}
+
+func TestReadOnlySessionShouldRejectPrompt(t *testing.T) {
+	folder := t.TempDir()
+	s := &harness.Session{SessionLite: harness.SessionLite{ID: "child", RealPath: folder, Harness: "codex", ParentSessID: "parent", ReadOnly: true}}
+	a := &app{
+		adapters: map[string]harness.Adapter{"codex": harness.DefaultAdapter{}},
+		sessions: map[string]map[sessionKey]*harness.Session{folder: {{harness: "codex", id: "child"}: s}},
+	}
+	body, err := json.Marshal(map[string]string{"folder": folder, "sessid": "child", "prompt": "hello", "harness": "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := testRequest(a.handlePrompt, http.MethodPost, "/api/prompt", string(body))
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", res.Code, http.StatusConflict, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "read-only") || s.QueuedMsg != "" {
+		t.Fatalf("unexpected response %s or queued=%q", res.Body.String(), s.QueuedMsg)
 	}
 }
 
@@ -223,10 +289,10 @@ func TestPollingAndSessionRefreshPreserveSessionIdentity(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range 100 {
-			var done sync.WaitGroup
-			done.Add(1)
-			a.pollSession(pollJob{session: s, done: &done})
-			done.Wait()
+			var pollJobsDone sync.WaitGroup
+			pollJobsDone.Add(1)
+			a.pollSession(pollJob{session: s, pollJobsDone: &pollJobsDone})
+			pollJobsDone.Wait()
 		}
 	}()
 	wg.Wait()

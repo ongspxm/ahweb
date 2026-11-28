@@ -178,8 +178,9 @@ func (a *app) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		done := &sync.WaitGroup{}
 		done.Add(1)
 		select {
-		case a.pollJobs <- pollJob{session: s, done: done, deleteResult: result, deleteLast: last}:
+		case a.pollJobs <- pollJob{session: s, pollJobsDone: done, deleteResult: result, deletePreviewTstamp: last}:
 		case <-r.Context().Done():
+			done.Done()
 			return r.Context().Err()
 		}
 		err := <-result
@@ -255,8 +256,9 @@ func (a *app) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	done := &sync.WaitGroup{}
 	done.Add(1)
 	select {
-	case a.pollJobs <- pollJob{session: s, done: done, deleteResult: result, deleteLast: last}:
+	case a.pollJobs <- pollJob{session: s, pollJobsDone: done, deleteResult: result, deletePreviewTstamp: last}:
 	case <-r.Context().Done():
+		done.Done()
 		return
 	}
 

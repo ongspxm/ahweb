@@ -27,7 +27,7 @@ ahweb help
 ## Development
 `go run .` (default port: `8321`); use `go run . -port 9090` to choose a port at startup.
 
-Run `scripts/setup-githooks.sh` for automated checks.
+Run `scripts/setup-githooks.sh` for automated checks. See `AGENTS.md` for coding rules and test commands.
 
 ## API
 All fields required unless marked optional.
@@ -38,6 +38,7 @@ All fields required unless marked optional.
   - `update`: concise newer-release notice; empty when not outdated.
   - `update_command`: copyable full update command.
   - `update_check_failed`: true if the update comparison could not complete.
+- `POST /api/update` starts the fixed update command shown on the Status tab.
 
 ### Config & models
 - `GET /api/config` returns all config as JSON; `GET /api/config?key=...` returns one value.
@@ -56,7 +57,7 @@ All fields required unless marked optional.
 - `POST /api/file?folder=...` accepts multipart `file` and folder-relative `path`; missing destination directories are created. Optional `overwrite=true` replaces an existing regular file; returns `{"path":"..."}`.
 
 ### Sessions & chat
-- `GET /api/list?folder=...` lists sessions for a folder.
+- `GET /api/list?folder=...` lists sessions for a folder; child sessions include `parent_sessid`.
 - `GET /api/events?folder=...&sessid=...&harness=...&start_from=0&opened=0` returns `sessid`, `name`, `events`, `busy`, `queued`, `queued_images`, `stats`, `tstamp`, and `last_opened`.
     - Set `opened=1` for the active chat to update `last_opened`.
     - Events have `seq` values starting at zero. Use `start_from=0` when opening a session; `start_from=-1` forces a full-history refresh from the web UI.
@@ -74,58 +75,58 @@ All fields required unless marked optional.
 - `GET /api/cli?folder=...&offset=...` is a WebSocket terminal stream. The optional byte `offset` resumes output; the server first sends a text `{"type":"offset","offset":N}` frame, then binary terminal output.
 
 ## Adapter interface
-Adapters implement `harness.Adapter`: to have consistency in code architecture across adapters.
+Adapters implement `harness.Adapter` (defined in `harness/types.go`) for consistent architecture across harnesses.
 
-these are generic adapter fns and should be implemented under "=== adapter admin fns" header
+Adapter admin fns:
 - `Ready() error` nil means ready. Failed adapters are dropped at startup.
-- `GetModels() (map[string]Model, error)` returns models keyed by model ID "provider/model" (always get from source)
+- `GetModels() (map[string]Model, error)` returns models keyed by source model ID; include provider only when source identifies it
 - `ListSessions(realFolder) ([]SessionLite, error)` lists saved sessions for a folder.
     - try best to get lastLimestampMs and name (name could be null)
     - optionally get the raw FirstUserMsg (if cheap to do)
     - if harness supports it, populate the parent sessID as well (empty for root sessions)
 
-these are session admin fns and should be implemented under "=== session admin fns" header
+Session admin fns:
 - `Connect(*Session, doForceReconnect) error` make sures that the connection is up and live after this call.
     - should be cheap to call (close to no-op) if connection is already alive.
     - returns a partial session obj (SessionLite)
 - `CleanUp(*Session) error` closes resources owned by one session.
 - `CanDelete() bool` reports whether session deletion is supported.
-- `Delete(*Session) error` permanently deletes a session. Run this from the poll worker.
-    - let's simplify the logic: no need to care about "child sessions", just delete
-    - rationale: if child session, its deleted based on time anyways, so should be deleted too
-    - on webui it doesnt spoil too, if have parentID, but parent no exist, webui handles well
+- `Delete(*Session) error` permanently deletes a session. Run this from the poll worker
 
-these are session fns (actually control the flow of the session) and should be impleted in "=== session fns" header
+Session flow fns:
 - `SendPrompt(*Session) error` sends `Session.SendingMsg` and its `Session.SendingImages`.
+- `CanSteer(haveImg bool) bool` true when `SendPrompt` can steer active run (`haveImg` = queued input has images). Poll worker sends queued input while busy if true; `SendPrompt` checks `Session.BusyCli` -> steer vs normal prompt.
 - `Poll(*Session) error` refreshes session events, title/first user message, and usage stats.
     - When `DoFullHistory` is set, it should load full history; otherwise it may load only new events.
 - `Rewind(*Session, rewindID)` rewinds to an event ID. Run this from the poll worker.
 - `Stop(*Session) error` stops the active session operation.
 
 Session adapter calls are run by the poll worker, except `Stop`, which the stop API calls directly.
-The interface is defined in `harness/types.go`.
-
-any other fns should be kepts under the "=== util fns" header
-Run checks with `go build ./...` and `go test ./...`.
 
 ## Adapter feature support
-`Y` = supported, `N` = not supported, `?` = partial or best effort.
+`1` = supported, `0` = not supported, `?` = partial or best effort.
+Event model/reasoning rows apply to assistant and thinking events; missing source metadata stays empty.
 
 | Feature | pi | prime | opencode | codex | cursor | claude | copilot |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Token count | Y | Y | ? | Y | Y | Y | Y |
-| Cost | Y | Y | Y | Y | Y | Y | Y |
-| Context usage | Y | Y | Y | Y | N | ? | N |
-| Reasoning levels | Y | Y | Y | Y | N | Y | Y |
-| Send images | Y | Y | Y | Y | Y | Y | Y |
-| Parent session IDs | Y | Y | Y | Y | N | N | N |
-| Tool results in saved history | Y | Y | Y | Y | ? | Y | Y |
-| Delete | Y | ? | Y | Y | N | N | Y |
-| Rewind | Y | N | Y | Y | N | N | N |
-| Full transcript thru files | N | N | N | N | Y | Y | Y |
-| Session ctrl thru global daemon | N | Y | Y | Y | N | N | N |
-| Session ctrl thru isolated RPC | Y | N | N | N | N | N | N |
-| Session ctrl thru short-lived cmd stdout | N | N | N | N | Y | Y | Y |
+| Reports usage - tokens | 1 | 1 | ? | 1 | 1 | 1 | 1 |
+| Reports usage - cost | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| Reports usage - context wind size | 1 | 1 | 1 | 1 | 0 | ? | 0 |
+| Returns thinking events | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| Returns images on historical reads | 1 | 1 | 1 | ? | 0 | ? | ? |
+| Returns tool details on historical reads | 1 | 1 | 1 | 1 | ? | 1 | 1 |
+| Return event model | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| Return event reasoning | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| Can set prompt reasoning | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| Can send prompt mid-run | 1 | 1 | 1 | 1 | 0 | 0 | 0 |
+| Can send images in prompts | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| Can open parent-child session | 1 | 1 | 1 | 1 | 1 | 1 | 0 |
+| Can Delete session | 1 | ? | 1 | 1 | 0 | 0 | 1 |
+| Can Rewind to previous user msg | 1 | 0 | 1 | 1 | 0 | 0 | 0 |
+| Impl historical reads thru file/db | 0 | 0 | 0 | 0 | 1 | 1 | 1 |
+| Impl Session ctrl thru shared conn | 0 | 1 | 1 | 1 | 0 | 0 | 0 |
+| Impl Session ctrl thru isolated RPC | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Impl Session ctrl thru short-lived cmd stdout | 0 | 0 | 0 | 0 | 1 | 1 | 1 |
 
 ### pi notes
 - each sess start one pi cli rpc
@@ -150,7 +151,7 @@ Run checks with `go build ./...` and `go test ./...`.
 ### claude notes
 - claude is cli based: means we use `claude -p` to send prompt, then read stdin for replies, it's not one long lived process
 - each process call ends up running a gofunc that listens and process into a cache, then Poll() copies cache content into Session.Events
-- claude got no parent sess id and context usage estimated hardcoded list
+- child transcripts are read as read-only sessions from `~/.claude/projects/<project>/<parent-id>/subagents/agent-<agent-id>.jsonl`
 - claude doesnt support headless rewind, skipping for now
 
 ### codex notes
@@ -159,9 +160,11 @@ Run checks with `go build ./...` and `go test ./...`.
 - poll will drain the events during Poll()
 - context compaction evts appear as assistant msgs: “Context compacted.”
 - each codex chat can only have one write connection (so we will set it as readonly when possible)
+- multi-agent v2 child sessions are read-only; Codex app-server disallows direct prompts to them
 
 ### cursor notes
-- cursor-agent doesn't provide context usage or parent session IDs
+- cursor-agent doesn't provide context usage
+- child transcripts are read as read-only sessions from `~/.cursor/projects/<project>/agent-transcripts/<parent-id>/subagents/<agent-id>.jsonl`
 - future: maybe to swap to agents sdk, but not very stable (nor native ui to view)
 - chats are resumed through the CLI, and saved history is read from Cursor's local `~/.cursor/projects` transcripts.
 - reading tool call from transcript doesnt return result, or success state
@@ -170,6 +173,8 @@ Run checks with `go build ./...` and `go test ./...`.
 ### copilot notes
 - few sources of info: event jsonl and sqlite3 db
 - sqlite3 db used for these use cases: list_sessions, token/cost usage, model listing
+- session is defined as (harnessID, harnessSubID), a parent session will have harnessSubID=""
+- child sessions are not controllable (cant SendPrompt, Delete, etc etc)
 - live polling using stdout from copilot cmd
 - delete is hacky: manual remove from db "sessions" table
 - rewind is not supported yet.

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"os/exec"
+
 	"golang.org/x/mod/semver"
 )
 
@@ -120,4 +122,18 @@ func formatUpdateNotice(current, latest string) string {
 		return ""
 	}
 	return fmt.Sprintf("Update available: %s.", latest)
+}
+
+func (a *app) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		apiMethodNotAllowed(w)
+		return
+	}
+	cmd := exec.Command("sh", "-c", updateCommand)
+	if err := cmd.Start(); err != nil {
+		apiWriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	go func() { _ = cmd.Wait() }()
+	apiWriteJSON(w, http.StatusAccepted, map[string]string{"status": "update started"})
 }

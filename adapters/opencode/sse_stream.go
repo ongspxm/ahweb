@@ -46,19 +46,28 @@ type apiUsage struct {
 	Tokens apiTokens `json:"tokens"`
 }
 
+type apiError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
+}
+
 type apiMessage struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
-	Text string `json:"text"`
-	Time struct {
+	ID    string    `json:"id"`
+	Type  string    `json:"type"`
+	Text  string    `json:"text"`
+	Error *apiError `json:"error"`
+	Time  struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
 	Model struct {
 		ID         string `json:"id"`
 		ProviderID string `json:"providerID"`
+		Variant    string `json:"variant"`
 	} `json:"model"`
-	Files []struct {
+	Variant string `json:"variant"`
+	Files   []struct {
 		Data   string `json:"data"`
 		Mime   string `json:"mime"`
 		URL    string `json:"url"`
@@ -142,7 +151,26 @@ func (m apiMessage) events() []harness.Event {
 	if m.Type != "assistant" {
 		return nil
 	}
-	out := make([]harness.Event, 0)
+	reasoning := m.Variant
+	if reasoning == "" {
+		reasoning = m.Model.Variant
+	}
+	out := make([]harness.Event, 0, len(m.Content)+1)
+	if m.Error != nil {
+		message := strings.TrimSpace(m.Error.Message)
+		if message == "" {
+			message = strings.TrimSpace(m.Error.Type)
+		}
+		if message == "" {
+			message = "unknown error"
+		}
+		if m.Error.Status > 0 {
+			message = fmt.Sprintf("OpenCode request failed (HTTP %d): %s", m.Error.Status, message)
+		} else {
+			message = fmt.Sprintf("OpenCode request failed: %s", message)
+		}
+		out = append(out, harness.Event{Type: harness.EventError, Content: message, TimestampMs: ts})
+	}
 	for _, part := range m.Content {
 		if (part.Type == "image" || part.Type == "file") && strings.HasPrefix(part.MIME, "image/") {
 			uri := part.URL
@@ -150,19 +178,19 @@ func (m apiMessage) events() []harness.Event {
 				uri = part.URI
 			}
 			if strings.HasPrefix(uri, "data:image/") {
-				out = append(out, harness.Event{Type: harness.EventAssistant, Images: []string{uri}, TimestampMs: ts, Model: model})
+				out = append(out, harness.Event{Type: harness.EventAssistant, Images: []string{uri}, TimestampMs: ts, Model: model, Reasoning: reasoning})
 			} else if uri != "" {
-				out = append(out, harness.Event{Type: harness.EventAssistant, Images: []string{harness.DataURI(part.MIME, uri)}, TimestampMs: ts, Model: model})
+				out = append(out, harness.Event{Type: harness.EventAssistant, Images: []string{harness.DataURI(part.MIME, uri)}, TimestampMs: ts, Model: model, Reasoning: reasoning})
 			}
 		}
 		switch part.Type {
 		case "reasoning":
 			if part.Text != "" {
-				out = append(out, harness.Event{Type: harness.EventThinking, Content: part.Text, TimestampMs: ts, Model: model})
+				out = append(out, harness.Event{Type: harness.EventThinking, Content: part.Text, TimestampMs: ts, Model: model, Reasoning: reasoning})
 			}
 		case "text":
 			if part.Text != "" {
-				out = append(out, harness.Event{Type: harness.EventAssistant, Content: part.Text, TimestampMs: ts, Model: model})
+				out = append(out, harness.Event{Type: harness.EventAssistant, Content: part.Text, TimestampMs: ts, Model: model, Reasoning: reasoning})
 			}
 		case "tool":
 			id := part.CallID
@@ -338,12 +366,15 @@ func processSSECache(id HarnessID, discardIncomplete bool) ([]apiMessage, []apiU
 			} `json:"time"`
 			ModelID    string          `json:"modelID"`
 			ProviderID string          `json:"providerID"`
+			Variant    string          `json:"variant"`
+			Error      *apiError       `json:"error"`
 			Cost       float64         `json:"cost"`
 			Tokens     apiTokens       `json:"tokens"`
 			Files      json.RawMessage `json:"files"`
 		}
 		_ = json.Unmarshal(partial.info, &info)
-		if len(partial.info) == 0 || len(partial.parts) == 0 || (info.Role != "user" && info.Time.Completed == 0) {
+		hasError := info.Error != nil
+		if len(partial.info) == 0 || (!hasError && (len(partial.parts) == 0 || (info.Role != "user" && info.Time.Completed == 0))) {
 			if !discardIncomplete {
 				retained = append(retained, partial.raws...)
 			}
@@ -356,12 +387,16 @@ func processSSECache(id HarnessID, discardIncomplete bool) ([]apiMessage, []apiU
 			}
 		}
 		message := map[string]any{
-			"id":     mid,
-			"type":   info.Role,
-			"time":   info.Time,
-			"model":  map[string]string{"id": info.ModelID, "providerID": info.ProviderID},
-			"cost":   info.Cost,
-			"tokens": info.Tokens,
+			"id":      mid,
+			"type":    info.Role,
+			"time":    info.Time,
+			"model":   map[string]string{"id": info.ModelID, "providerID": info.ProviderID},
+			"variant": info.Variant,
+			"cost":    info.Cost,
+			"tokens":  info.Tokens,
+		}
+		if hasError {
+			message["error"] = info.Error
 		}
 		if info.Role == "user" {
 			var text strings.Builder

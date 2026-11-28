@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ongspxm/ahweb/harness"
+	"github.com/ongspxm/ahweb/internal/processgroup"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -77,7 +78,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 				if modelOption.Value == "" {
 					continue
 				}
-				id := "copilot/" + modelOption.Value
+				id := modelOption.Value
 				models[id] = harness.Model{Harness: "copilot", ID: id, Reasoning: append([]string(nil), reasoning...)}
 			}
 		}
@@ -88,7 +89,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 			if model.ModelID == "" {
 				continue
 			}
-			id := "copilot/" + model.ModelID
+			id := model.ModelID
 			models[id] = harness.Model{Harness: "copilot", ID: id, Reasoning: append([]string(nil), reasoning...)}
 		}
 		if len(models) == 0 {
@@ -224,21 +225,87 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		}
 		seen[localID] = true
 		sessions = append(sessions, lite)
+		for harnessSubID, child := range copilotChildren(id) {
+			if seen[harnessSubID] {
+				continue
+			}
+			seen[harnessSubID] = true
+			sessions = append(sessions, harness.SessionLite{
+				ID:              harnessSubID,
+				RealPath:        cwd,
+				Harness:         "copilot",
+				FirstUserMsg:    child.name,
+				LastTimestampMs: child.lastTimestampMs,
+				ParentSessID:    localID,
+				ReadOnly:        true,
+			})
+		}
 	}
 	return sessions, rows.Err()
 }
 
 // === session admin fns
 
+type copilotChild struct {
+	name            string
+	lastTimestampMs int64
+}
+
 type conn struct {
-	mu                     sync.Mutex
-	cmd                    *exec.Cmd
-	done                   chan struct{}
-	harnessID              string
-	busy, closing, started bool
+	mu                              sync.Mutex
+	cmd                             *exec.Cmd
+	done                            chan struct{}
+	harnessSessionID                string
+	harnessSubID                    string
+	busy, closing, stopped, started bool
+	lastReasoning                   string
+	model, reasoning                string
 
 	events, errors []harness.Event
 	used, size     int64
+	usage          usageTotals
+}
+
+type usageTotals struct {
+	input, output, cacheRead, cacheWrite, totalNanoAiu int64
+	usageIDs                                           map[string]struct{}
+	hasTokens, hasCost                                 bool
+}
+
+func (u *usageTotals) add(msg copilotMsg) {
+	switch msg.Type {
+	case "session.usage_record":
+		usage, _ := msg.Data["usage"].(map[string]any)
+		var values [4]int64
+		found := false
+		for i, key := range [...]string{"inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"} {
+			if value, ok := usage[key].(float64); ok && value >= 0 {
+				values[i], found = int64(value), true
+			}
+		}
+		if !found {
+			return
+		}
+		accounting, _ := usage["accounting"].(map[string]any)
+		if id, _ := accounting["usageId"].(string); id != "" {
+			if u.usageIDs == nil {
+				u.usageIDs = make(map[string]struct{})
+			}
+			if _, seen := u.usageIDs[id]; seen {
+				return
+			}
+			u.usageIDs[id] = struct{}{}
+		}
+		u.input += values[0]
+		u.output += values[1]
+		u.cacheRead += values[2]
+		u.cacheWrite += values[3]
+		u.hasTokens = true
+	case "session.usage_checkpoint":
+		if value, ok := msg.Data["totalNanoAiu"].(float64); ok && value >= 0 {
+			u.totalNanoAiu, u.hasCost = int64(value), true
+		}
+	}
 }
 
 var (
@@ -249,8 +316,18 @@ var (
 )
 
 func (*Adapter) Connect(s *harness.Session, _ bool) error {
+	_sessionID := func(id string) string {
+		if !strings.Contains(id, "-") {
+			if decoded, err := hex.DecodeString(id); err == nil && len(decoded) == 16 {
+				decoded[6] = decoded[6]&0x0f | 0x40
+				decoded[8] = decoded[8]&0x3f | 0x80
+				return fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
+			}
+		}
+		return id
+	}
+
 	cacheMu.Lock()
-	defer cacheMu.Unlock()
 	if cache[s.RealPath] == nil {
 		cache[s.RealPath] = make(map[string]*conn)
 	}
@@ -260,20 +337,51 @@ func (*Adapter) Connect(s *harness.Session, _ bool) error {
 	if sessIDToHarnessID[s.RealPath] == nil {
 		sessIDToHarnessID[s.RealPath] = make(map[string]string)
 	}
-	if cache[s.RealPath][s.ID] == nil {
-		harnessID := s.ID
-		if !strings.Contains(harnessID, "-") {
-			if decoded, err := hex.DecodeString(harnessID); err == nil && len(decoded) == 16 {
-				decoded[6] = decoded[6]&0x0f | 0x40
-				decoded[8] = decoded[8]&0x3f | 0x80
-				harnessID = fmt.Sprintf("%x-%x-%x-%x-%x", decoded[:4], decoded[4:6], decoded[6:8], decoded[8:10], decoded[10:])
-			}
+
+	if s.ParentSessID == "" {
+		c := cache[s.RealPath][s.ID]
+		if c == nil {
+			harnessSessionID := _sessionID(s.ID)
+			harnessIDToSessID[s.RealPath][s.ID] = s.ID
+			harnessIDToSessID[s.RealPath][harnessSessionID] = s.ID
+			sessIDToHarnessID[s.RealPath][s.ID] = harnessSessionID
+			c = &conn{harnessSessionID: harnessSessionID}
+			cache[s.RealPath][s.ID] = c
 		}
-		harnessIDToSessID[s.RealPath][s.ID] = s.ID
-		harnessIDToSessID[s.RealPath][harnessID] = s.ID
-		sessIDToHarnessID[s.RealPath][s.ID] = harnessID
-		cache[s.RealPath][s.ID] = &conn{harnessID: harnessID}
+		cacheMu.Unlock()
+		if c.harnessSubID != "" {
+			return errors.New("Copilot subagent ID cannot be connected as a root session")
+		}
+		return nil
 	}
+
+	parentSessionID := sessIDToHarnessID[s.RealPath][s.ParentSessID]
+	if parentSessionID == "" {
+		parentSessionID = _sessionID(s.ParentSessID)
+	}
+	existing := cache[s.RealPath][s.ID]
+	cacheMu.Unlock()
+
+	if existing != nil {
+		if existing.harnessSubID != s.ID || existing.harnessSessionID != parentSessionID {
+			return errors.New("Copilot subagent ID is already connected to another session")
+		}
+		return nil
+	}
+
+	_, ok := copilotChildren(parentSessionID)[s.ID]
+	if !ok {
+		return errors.New("Copilot subagent was not found in its parent session")
+	}
+	c := &conn{harnessSessionID: parentSessionID, harnessSubID: s.ID}
+	cacheMu.Lock()
+	if existing = cache[s.RealPath][s.ID]; existing == nil {
+		cache[s.RealPath][s.ID] = c
+	} else if existing.harnessSubID != s.ID || existing.harnessSessionID != parentSessionID {
+		cacheMu.Unlock()
+		return errors.New("Copilot subagent ID is already connected to another session")
+	}
+	cacheMu.Unlock()
 	return nil
 }
 
@@ -285,6 +393,10 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 		return nil
 	}
 	c.mu.Lock()
+	if c.harnessSubID != "" {
+		c.mu.Unlock()
+		return nil
+	}
 	c.closing = true
 	cmd, done := c.cmd, c.done
 	c.mu.Unlock()
@@ -296,6 +408,11 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 	}
 	cacheMu.Lock()
 	delete(cache[s.RealPath], s.ID)
+	for id, child := range cache[s.RealPath] {
+		if child.harnessSubID != "" && child.harnessSessionID == c.harnessSessionID {
+			delete(cache[s.RealPath], id)
+		}
+	}
 	cacheMu.Unlock()
 	return nil
 }
@@ -303,13 +420,16 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 func (*Adapter) CanDelete() bool { return true }
 
 func (a *Adapter) Delete(s *harness.Session) error {
+	if s.ParentSessID != "" {
+		return nil
+	}
 	if s.GetIsBusy() {
 		return errors.New("cannot delete a busy Copilot session")
 	}
 
 	cacheMu.Lock()
 	c := cache[s.RealPath][s.ID]
-	harnessID := sessIDToHarnessID[s.RealPath][s.ID]
+	harnessSessionID := sessIDToHarnessID[s.RealPath][s.ID]
 	cacheMu.Unlock()
 	if c != nil {
 		c.mu.Lock()
@@ -323,7 +443,7 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	if err := a.CleanUp(s); err != nil {
 		return err
 	}
-	stateDir := filepath.Join(copilotHome(), "session-state", harnessID)
+	stateDir := filepath.Join(copilotHome(), "session-state", harnessSessionID)
 	if err := os.RemoveAll(stateDir); err != nil {
 		return fmt.Errorf("could not remove Copilot session state: %w", err)
 	}
@@ -332,7 +452,7 @@ func (a *Adapter) Delete(s *harness.Session) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			cacheMu.Lock()
-			delete(harnessIDToSessID[s.RealPath], harnessID)
+			delete(harnessIDToSessID[s.RealPath], harnessSessionID)
 			delete(harnessIDToSessID[s.RealPath], s.ID)
 			delete(sessIDToHarnessID[s.RealPath], s.ID)
 			cacheMu.Unlock()
@@ -341,11 +461,11 @@ func (a *Adapter) Delete(s *harness.Session) error {
 		return fmt.Errorf("could not open Copilot session store: %w", err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, harnessID); err != nil {
+	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, harnessSessionID); err != nil {
 		return fmt.Errorf("could not remove Copilot session index: %w", err)
 	}
 	cacheMu.Lock()
-	delete(harnessIDToSessID[s.RealPath], harnessID)
+	delete(harnessIDToSessID[s.RealPath], harnessSessionID)
 	delete(harnessIDToSessID[s.RealPath], s.ID)
 	delete(sessIDToHarnessID[s.RealPath], s.ID)
 	cacheMu.Unlock()
@@ -359,10 +479,14 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	if err != nil {
 		return err
 	}
+	if c.harnessSubID != "" {
+		return fmt.Errorf("%w: Copilot subagent sessions do not accept direct input; prompt the parent session instead", harness.ErrPromptRejected)
+	}
 
 	// setup the cli cmd
 	s.Mu.Lock()
-	prompt, images, model, effort := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning
+	prompt, images, model, reasoning := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning
+	s.BusyCli = true
 	s.Mu.Unlock()
 	args := []string{"-p", prompt, "--output-format", "json", "--stream", "on", "--allow-all"}
 	c.mu.Lock()
@@ -370,22 +494,22 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		c.mu.Unlock()
 		return errors.New("Copilot session is busy")
 	}
-	id := c.harnessID
+	harnessSessionID := c.harnessSessionID
 	if strings.Contains(s.ID, "-") || c.started {
-		args = append(args, "--resume="+id)
+		args = append(args, "--resume="+harnessSessionID)
 	} else {
-		args = append(args, "--session-id="+id)
+		args = append(args, "--session-id="+harnessSessionID)
 	}
 	if model != nil && model.ID != "" {
-		args = append(args, "--model", strings.TrimPrefix(model.ID, "copilot/"))
+		args = append(args, "--model", model.ID)
 	}
-	if effort != "" {
-		args = append(args, "--reasoning-effort", effort)
+	if reasoning != "" {
+		args = append(args, "--reasoning-effort", reasoning)
 	}
 
 	// form the actual imgs
 	var attachments []string
-	attachmentDir := filepath.Join(copilotHome(), "session-state", id, "attachments")
+	attachmentDir := filepath.Join(copilotHome(), "session-state", harnessSessionID, "attachments")
 	keepAttachments := false
 	defer func() {
 		if !keepAttachments {
@@ -447,13 +571,17 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		c.mu.Unlock()
 		return err
 	}
-	if err = cmd.Start(); err != nil {
+	if err = processgroup.Start(cmd); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	keepAttachments = true
 	done := make(chan struct{})
-	c.cmd, c.done, c.busy, c.started = cmd, done, true, true
+	c.cmd, c.done, c.busy, c.stopped, c.started = cmd, done, true, false, true
+	c.model, c.reasoning = "", reasoning
+	if model != nil {
+		c.model = model.ID
+	}
 	userEvent := harness.Event{Type: harness.EventUser, Content: prompt, Images: append([]string(nil), images...), TimestampMs: time.Now().UnixMilli()}
 	c.mu.Unlock()
 
@@ -461,7 +589,6 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	// claim: the cmd will add it to the events.jsonl immediately
 	s.Mu.Lock()
 	s.Events = append(s.Events, userEvent)
-	s.BusyCli = true
 	s.Mu.Unlock()
 
 	// processing evts from stdout
@@ -469,39 +596,82 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 		for scanner.Scan() {
-			// here we skipUser because we manually added to s.Events directly
-			msg, event, ok := parseJsonToEvent(scanner.Bytes(), true)
+			msg, events, ok := parseJsonToEvents(scanner.Bytes())
 			if !ok {
 				continue
 			}
 
-			c.mu.Lock()
-			if event.Type != "" {
-				c.events = append(c.events, event)
+			target := c
+			if msg.HarnessSubID != "" {
+				c.mu.Lock()
+				parentSessionID := c.harnessSessionID
+				c.mu.Unlock()
+				cacheMu.Lock()
+				target = cache[s.RealPath][msg.HarnessSubID]
+				if target == nil && msg.Type == "subagent.started" {
+					target = &conn{harnessSessionID: parentSessionID, harnessSubID: msg.HarnessSubID}
+					cache[s.RealPath][msg.HarnessSubID] = target
+				}
+				cacheMu.Unlock()
+				if target == nil || target.harnessSubID != msg.HarnessSubID {
+					target = c
+				}
+			}
+
+			target.mu.Lock()
+			target.usage.add(msg)
+			copilotUpdateSelection(msg, &target.model, &target.reasoning)
+			for _, event := range events {
+				if event.Type == harness.EventAssistant || event.Type == harness.EventThinking {
+					if event.Model == "" {
+						event.Model = target.model
+					}
+					if event.Reasoning == "" {
+						event.Reasoning = target.reasoning
+					}
+				}
+				if event.Type == harness.EventThinking {
+					if target.lastReasoning == event.Content {
+						continue
+					}
+					target.lastReasoning = event.Content
+				}
+				if event.Type == harness.EventUser && target == c {
+					continue
+				}
+				if target.harnessSubID == "" {
+					target.events = append(target.events, event)
+				}
 			}
 			switch msg.Type {
+			case "user.message":
+				target.lastReasoning = ""
 			case "session.start":
-				if id, _ := msg.Data["sessionId"].(string); id != "" {
-					c.harnessID = id
+				if sessionID, _ := msg.Data["sessionId"].(string); sessionID != "" && target.harnessSubID == "" {
+					target.harnessSessionID = sessionID
 					cacheMu.Lock()
-					harnessIDToSessID[s.RealPath][id] = s.ID
-					sessIDToHarnessID[s.RealPath][s.ID] = id
+					harnessIDToSessID[s.RealPath][sessionID] = s.ID
+					sessIDToHarnessID[s.RealPath][s.ID] = sessionID
 					cacheMu.Unlock()
 				}
 			case "session.usage_info":
 				if used, ok := msg.Data["used"].(float64); ok {
-					c.used = int64(used)
+					target.used = int64(used)
 				}
 				if size, ok := msg.Data["size"].(float64); ok {
-					c.size = int64(size)
+					target.size = int64(size)
 				}
+			case "subagent.started":
+				target.busy = true
+			case "subagent.completed":
+				target.busy = false
 			}
-			c.mu.Unlock()
+			target.mu.Unlock()
 		}
 		scanErr := scanner.Err()
 		waitErr := cmd.Wait()
 		c.mu.Lock()
-		if !c.closing {
+		if !c.closing && !c.stopped {
 			if scanErr != nil {
 				c.errors = append(c.errors, harness.Event{Type: harness.EventError, Content: scanErr.Error(), TimestampMs: time.Now().UnixMilli()})
 			}
@@ -509,8 +679,24 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 				c.errors = append(c.errors, harness.Event{Type: harness.EventError, Content: waitErr.Error(), TimestampMs: time.Now().UnixMilli()})
 			}
 		}
-		c.cmd, c.busy = nil, false
+		c.cmd, c.busy, c.stopped = nil, false, false
+		parentSessionID := c.harnessSessionID
 		c.mu.Unlock()
+		cacheMu.Lock()
+
+		// update the busy flag for child session
+		var childConns []*conn
+		for _, child := range cache[s.RealPath] {
+			if child.harnessSubID != "" && child.harnessSessionID == parentSessionID {
+				childConns = append(childConns, child)
+			}
+		}
+		cacheMu.Unlock()
+		for _, child := range childConns {
+			child.mu.Lock()
+			child.busy = false
+			child.mu.Unlock()
+		}
 		close(done)
 	}()
 	return nil
@@ -528,27 +714,55 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	// SQLite provides usage totals; events.jsonl provides conversation history.
 	c.mu.Lock()
 	busy := c.busy
-	harnessID := c.harnessID
+	harnessSessionID := c.harnessSessionID
+	harnessSubID := c.harnessSubID
 	c.mu.Unlock()
+	var children map[string]copilotChild
+	if fullHistory && harnessSubID == "" {
+		children = copilotChildren(harnessSessionID)
+	}
+	var logUsage usageTotals
 
-	_readSessionEvents := func(id string) []harness.Event {
-		file, err := os.Open(filepath.Join(copilotHome(), "session-state", id, "events.jsonl"))
+	_readSessionEvents := func(sessionID, harnessSubID string) []harness.Event {
+		file, err := os.Open(filepath.Join(copilotHome(), "session-state", sessionID, "events.jsonl"))
 		if err != nil {
 			return nil
 		}
 		defer file.Close()
 
 		var events []harness.Event
+		model, reasoning := "", ""
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 		for scanner.Scan() {
-			_, event, ok := parseJsonToEvent(scanner.Bytes(), false)
+			msg, parsed, ok := parseJsonToEvents(scanner.Bytes())
 			if !ok {
 				continue
 			}
-			if event.Type != "" {
-				events = append(events, event)
+			if harnessSubID != "" && msg.HarnessSubID != harnessSubID {
+				continue
 			}
+			if harnessSubID == "" {
+				if _, isChild := children[msg.HarnessSubID]; msg.HarnessSubID != "" && isChild {
+					continue
+				}
+			}
+			if !busy {
+				logUsage.add(msg)
+			}
+			copilotUpdateSelection(msg, &model, &reasoning)
+			for i := range parsed {
+				if parsed[i].Type != harness.EventAssistant && parsed[i].Type != harness.EventThinking {
+					continue
+				}
+				if parsed[i].Model == "" {
+					parsed[i].Model = model
+				}
+				if parsed[i].Reasoning == "" {
+					parsed[i].Reasoning = reasoning
+				}
+			}
+			events = append(events, parsed...)
 		}
 		if scanner.Err() != nil {
 			return nil
@@ -559,8 +773,18 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	// first we setup full events
 	c.mu.Lock()
 	var events []harness.Event
-	if fullHistory {
-		events = _readSessionEvents(harnessID)
+	if fullHistory || harnessSubID != "" {
+		events = _readSessionEvents(harnessSessionID, harnessSubID)
+		if !busy {
+			if logUsage.hasTokens {
+				c.usage.input, c.usage.output = logUsage.input, logUsage.output
+				c.usage.cacheRead, c.usage.cacheWrite = logUsage.cacheRead, logUsage.cacheWrite
+				c.usage.usageIDs, c.usage.hasTokens = logUsage.usageIDs, true
+			}
+			if logUsage.hasCost {
+				c.usage.totalNanoAiu, c.usage.hasCost = logUsage.totalNanoAiu, true
+			}
+		}
 	} else {
 		s.Mu.Lock()
 		events = append([]harness.Event(nil), s.Events...)
@@ -570,6 +794,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	c.errors = nil
 	c.events = nil
 	used, size := c.used, c.size
+	usage := c.usage
 	c.mu.Unlock()
 
 	// then read the db usage details
@@ -577,9 +802,21 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	dbCost := 0.0
 	if db, err := copilotDB(); err == nil {
 		defer db.Close()
-		_ = db.QueryRow(`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) FROM assistant_usage_events WHERE session_id = ?`, harnessID).Scan(&dbInput, &dbOutput, &dbCacheRead, &dbCacheWrite)
-		_ = db.QueryRow(`SELECT COALESCE(SUM(total_nano_aiu), 0) FROM assistant_usage_events WHERE session_id = ?`, harnessID).Scan(&totalNanoAiu)
+		args := []any{harnessSessionID}
+		harnessSubFilter := ""
+		if harnessSubID != "" {
+			harnessSubFilter = " AND agent_id = ?"
+			args = append(args, harnessSubID)
+		}
+		_ = db.QueryRow(`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) FROM assistant_usage_events WHERE session_id = ?`+harnessSubFilter, args...).Scan(&dbInput, &dbOutput, &dbCacheRead, &dbCacheWrite)
+		_ = db.QueryRow(`SELECT COALESCE(SUM(total_nano_aiu), 0) FROM assistant_usage_events WHERE session_id = ?`+harnessSubFilter, args...).Scan(&totalNanoAiu)
 		dbCost = float64(totalNanoAiu) / 1_000_000_000 * 0.01
+	}
+	if usage.hasTokens {
+		dbInput, dbOutput, dbCacheRead, dbCacheWrite = usage.input, usage.output, usage.cacheRead, usage.cacheWrite
+	}
+	if usage.hasCost {
+		dbCost = float64(usage.totalNanoAiu) / 1_000_000_000 * 0.01
 	}
 
 	// then patch up the session stats
@@ -589,7 +826,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.CacheReadToken, s.CacheWriteToken = dbCacheRead, dbCacheWrite
 	s.FullCost = dbCost
 	s.ContextTokens, s.ContextWindow = used, size
-	if fullHistory {
+	if fullHistory && harnessSubID == "" {
 		s.FirstUserMsg = ""
 	}
 	firstUserFound := s.FirstUserMsg != ""
@@ -606,14 +843,28 @@ func (a *Adapter) Poll(s *harness.Session) error {
 }
 
 func (a *Adapter) Stop(s *harness.Session) error {
+	if s.ParentSessID != "" {
+		return errors.New("Copilot subagent sessions cannot be stopped independently; stop the parent session instead")
+	}
 	c, err := a.conn(s)
 	if err != nil {
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cmd != nil && c.cmd.Process != nil {
-		return c.cmd.Process.Kill()
+	if c.harnessSubID != "" {
+		c.mu.Unlock()
+		return errors.New("Copilot subagent sessions cannot be stopped independently; stop the parent session instead")
+	}
+	cmd, done := c.cmd, c.done
+	if cmd != nil {
+		c.stopped = true
+	}
+	c.mu.Unlock()
+	if err := processgroup.Kill(cmd); err != nil {
+		return err
+	}
+	if done != nil {
+		<-done
 	}
 	return nil
 }
@@ -654,19 +905,75 @@ func copilotDB() (*sql.DB, error) {
 	return db, nil
 }
 
-type copilotMsg struct {
-	Type      string         `json:"type"`
-	Timestamp string         `json:"timestamp"`
-	Data      map[string]any `json:"data"`
+func copilotChildren(sessionID string) map[string]copilotChild {
+	file, err := os.Open(filepath.Join(copilotHome(), "session-state", sessionID, "events.jsonl"))
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	children := make(map[string]copilotChild)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		var msg copilotMsg
+		if json.Unmarshal(scanner.Bytes(), &msg) != nil || msg.HarnessSubID == "" {
+			continue
+		}
+		child, exists := children[msg.HarnessSubID]
+		if msg.Type == "subagent.started" {
+			child.name, _ = msg.Data["agentDisplayName"].(string)
+			if child.name == "" {
+				child.name, _ = msg.Data["agentName"].(string)
+			}
+			exists = true
+		} else if !exists {
+			continue
+		}
+		if stamp, err := time.Parse(time.RFC3339Nano, msg.Timestamp); err == nil && stamp.UnixMilli() > child.lastTimestampMs {
+			child.lastTimestampMs = stamp.UnixMilli()
+		}
+		children[msg.HarnessSubID] = child
+	}
+	if scanner.Err() != nil {
+		return nil
+	}
+	return children
 }
 
-func parseJsonToEvent(line []byte, skipUser bool) (copilotMsg, harness.Event, bool) {
+type copilotMsg struct {
+	Type         string         `json:"type"`
+	Timestamp    string         `json:"timestamp"`
+	HarnessSubID string         `json:"agentId"`
+	Data         map[string]any `json:"data"`
+}
+
+func copilotUpdateSelection(msg copilotMsg, model, reasoning *string) {
+	var modelValue any
+	switch msg.Type {
+	case "session.start", "session.resume":
+		modelValue = msg.Data["selectedModel"]
+	case "session.model_change":
+		modelValue = msg.Data["newModel"]
+	case "model.model_call_success":
+		if modelCall, ok := msg.Data["modelCall"].(map[string]any); ok {
+			modelValue = modelCall["model"]
+		}
+	case "assistant.message", "assistant.reasoning":
+		modelValue = msg.Data["model"]
+	}
+	if value, _ := modelValue.(string); value != "" {
+		*model = value
+	}
+	if value, exists := msg.Data["reasoningEffort"]; exists {
+		*reasoning, _ = value.(string)
+	}
+}
+
+func parseJsonToEvents(line []byte) (copilotMsg, []harness.Event, bool) {
 	var msg copilotMsg
 	if json.Unmarshal(line, &msg) != nil || msg.Data == nil {
-		return msg, harness.Event{}, false
-	}
-	if skipUser && msg.Type == "user.message" {
-		return msg, harness.Event{}, false
+		return msg, nil, false
 	}
 	stamp := int64(0)
 	if parsed, err := time.Parse(time.RFC3339Nano, msg.Timestamp); err == nil {
@@ -675,41 +982,49 @@ func parseJsonToEvent(line []byte, skipUser bool) (copilotMsg, harness.Event, bo
 	if stamp == 0 {
 		stamp = time.Now().UnixMilli()
 	}
-	var event harness.Event
+	var events []harness.Event
 	switch msg.Type {
-	case "user.message", "assistant.message":
-		// here we choose to ignore message_delta, we checked
-		// assistant.message always follows message_delta
+	case "user.message":
 		content, _ := msg.Data["content"].(string)
 		images := []string{}
-		if msg.Type == "user.message" {
-			if attachments, ok := msg.Data["attachments"].([]any); ok {
-				for _, raw := range attachments {
-					attachment, ok := raw.(map[string]any)
-					if !ok {
-						continue
-					}
-					mimeType, _ := attachment["mimeType"].(string)
-					if !strings.HasPrefix(mimeType, "image/") {
-						continue
-					}
-					path, _ := attachment["path"].(string)
-					data, err := os.ReadFile(path)
-					if err != nil {
-						continue
-					}
-					if uri := harness.DataURI(mimeType, base64.StdEncoding.EncodeToString(data)); uri != "" {
-						images = append(images, uri)
-					}
+		if attachments, ok := msg.Data["attachments"].([]any); ok {
+			for _, raw := range attachments {
+				attachment, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				mimeType, _ := attachment["mimeType"].(string)
+				if !strings.HasPrefix(mimeType, "image/") {
+					continue
+				}
+				path, _ := attachment["path"].(string)
+				data, err := os.ReadFile(path)
+				if err != nil {
+					continue
+				}
+				if uri := harness.DataURI(mimeType, base64.StdEncoding.EncodeToString(data)); uri != "" {
+					images = append(images, uri)
 				}
 			}
 		}
 		if strings.TrimSpace(content) != "" || len(images) > 0 {
-			typ := harness.EventAssistant
-			if msg.Type == "user.message" {
-				typ = harness.EventUser
-			}
-			event = harness.Event{Type: typ, Content: content, Images: images, TimestampMs: stamp}
+			events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: stamp})
+		}
+	case "assistant.message":
+		// here we choose to ignore assistant.message_delta, cos assistant.message will arrive later
+		model, _ := msg.Data["model"].(string)
+		reasoning, _ := msg.Data["reasoningEffort"].(string)
+		if text, _ := msg.Data["reasoningText"].(string); strings.TrimSpace(text) != "" {
+			events = append(events, harness.Event{Type: harness.EventThinking, Content: strings.TrimSpace(text), TimestampMs: stamp, Model: model, Reasoning: reasoning})
+		}
+		if content, _ := msg.Data["content"].(string); strings.TrimSpace(content) != "" {
+			events = append(events, harness.Event{Type: harness.EventAssistant, Content: content, TimestampMs: stamp, Model: model, Reasoning: reasoning})
+		}
+	case "assistant.reasoning":
+		model, _ := msg.Data["model"].(string)
+		reasoning, _ := msg.Data["reasoningEffort"].(string)
+		if content, _ := msg.Data["content"].(string); strings.TrimSpace(content) != "" {
+			events = append(events, harness.Event{Type: harness.EventThinking, Content: strings.TrimSpace(content), TimestampMs: stamp, Model: model, Reasoning: reasoning})
 		}
 	case "tool.execution_start":
 		callID, _ := msg.Data["toolCallId"].(string)
@@ -732,7 +1047,7 @@ func parseJsonToEvent(line []byte, skipUser bool) (copilotMsg, harness.Event, bo
 		case string:
 			detail = args
 		}
-		event = harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: callID, Content: detail, TimestampMs: stamp}
+		events = append(events, harness.Event{Type: harness.EventToolStart, ToolName: name, ToolCallID: callID, Content: detail, TimestampMs: stamp})
 	case "tool.execution_complete":
 		callID, _ := msg.Data["toolCallId"].(string)
 		result, _ := msg.Data["result"].(map[string]any)
@@ -750,7 +1065,7 @@ func parseJsonToEvent(line []byte, skipUser bool) (copilotMsg, harness.Event, bo
 			}
 			failed = exitCode != 0
 		}
-		event = harness.Event{Type: harness.EventToolEnd, ToolCallID: callID, ToolFailed: failed, Content: content, TimestampMs: stamp}
+		events = append(events, harness.Event{Type: harness.EventToolEnd, ToolCallID: callID, ToolFailed: failed, Content: content, TimestampMs: stamp})
 	}
-	return msg, event, true
+	return msg, events, true
 }

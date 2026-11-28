@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ongspxm/ahweb/harness"
+	"github.com/ongspxm/ahweb/internal/processgroup"
 )
 
 type SessionConn struct {
@@ -137,17 +138,15 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 		return nil, fmt.Errorf("could not open prime output: %w", err)
 	}
 	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := processgroup.Start(cmd); err != nil {
 		return nil, fmt.Errorf("could not start prime: %w", err)
 	}
 	defer func() {
 		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = processgroup.Kill(cmd)
 		_ = cmd.Wait()
 	}()
-	timer := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
+	timer := time.AfterFunc(30*time.Second, func() { _ = processgroup.Kill(cmd) })
 	defer timer.Stop()
 	if _, err := io.WriteString(stdin, `{"id":"models","type":"get_available_models"}`+"\n"); err != nil {
 		return nil, fmt.Errorf("could not ask prime for models: %w", err)
@@ -180,7 +179,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 			entry := harness.Model{Harness: "prime", ID: modelID}
 			if model.Reasoning {
 				for _, level := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
-					if effort, ok := model.ThinkingLevelMap[level]; ok && effort != nil {
+					if reasoning, ok := model.ThinkingLevelMap[level]; ok && reasoning != nil {
 						entry.Reasoning = append(entry.Reasoning, level)
 					}
 				}
@@ -595,12 +594,29 @@ func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	s.Mu.Lock()
-	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
+	model, reasoning, prompt, busy := s.PromptModel, s.PromptReasoning, s.SendingMsg, s.BusyCli
 	images := append([]string(nil), s.SendingImages...)
+	s.BusyCli = true
 	s.Mu.Unlock()
 	sessionConnsMu.Lock()
 	conn := sessionConns[s.RealPath][s.ID]
 	sessionConnsMu.Unlock()
+	if busy && len(images) == 0 {
+		if conn == nil {
+			return errors.New("Prime session is not connected")
+		}
+		conn.Mu.Lock()
+		harnessID := conn.HarnessID
+		conn.Mu.Unlock()
+		if harnessID == "" {
+			return errors.New("Prime session is not connected")
+		}
+		output, err := exec.Command("prime-agent", "send", "--steer", "--json", harnessID, prompt).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("Prime steering failed: %s: %w", strings.TrimSpace(string(output)), err)
+		}
+		return nil
+	}
 	if conn == nil {
 		return errors.New("prime session is not connected")
 	}
@@ -648,11 +664,10 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	if err := conn.call("prompt", payload, nil); err != nil {
 		return err
 	}
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
 	return nil
 }
+
+func (*Adapter) CanSteer(haveImg bool) bool { return !haveImg }
 
 func (a *Adapter) Stop(s *harness.Session) error {
 	conn, err := a.sessionConn(s)
@@ -706,13 +721,17 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	full = full || needsFull
 
 	type primeMessage struct {
-		Role       string          `json:"role"`
-		Content    json.RawMessage `json:"content"`
-		Timestamp  json.RawMessage `json:"timestamp"`
-		Model      string          `json:"model"`
-		ToolCallID string          `json:"toolCallId"`
-		ToolName   string          `json:"toolName"`
-		IsError    bool            `json:"isError"`
+		Role          string          `json:"role"`
+		Content       json.RawMessage `json:"content"`
+		Timestamp     json.RawMessage `json:"timestamp"`
+		Provider      string          `json:"provider"`
+		Model         string          `json:"model"`
+		ThinkingLevel string          `json:"thinkingLevel"`
+		Effort        string          `json:"effort"`
+		ToolCallID    string          `json:"toolCallId"`
+		ToolName      string          `json:"toolName"`
+		IsError       bool            `json:"isError"`
+		ErrorMessage  string          `json:"errorMessage"`
 	}
 	var messages []primeMessage
 	ids := []string(nil)
@@ -900,6 +919,14 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		if message.Role == "custom" {
 			continue
 		}
+		model := message.Model
+		if model != "" && message.Provider != "" && !strings.Contains(model, "/") {
+			model = message.Provider + "/" + model
+		}
+		reasoning := message.ThinkingLevel
+		if reasoning == "" {
+			reasoning = message.Effort
+		}
 		timestamp := messageTimestamp(message.Timestamp)
 		var content string
 		var images []string
@@ -925,7 +952,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 						}
 					case "thinking":
 						if text := strings.TrimSpace(part.Thinking); text != "" && message.Role == "assistant" {
-							events = append(events, harness.Event{Type: harness.EventThinking, Content: text, TimestampMs: timestamp, Model: message.Model})
+							events = append(events, harness.Event{Type: harness.EventThinking, Content: text, TimestampMs: timestamp, Model: model, Reasoning: reasoning})
 						}
 					case "toolCall":
 						var args string
@@ -959,8 +986,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				events = append(events, harness.Event{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp, RewindID: ids[i]})
 			}
 		case "assistant":
+			if message.ErrorMessage != "" {
+				events = append(events, harness.Event{Type: harness.EventError, Content: message.ErrorMessage, TimestampMs: timestamp})
+			}
 			if content = strings.TrimSpace(content); content != "" || len(images) > 0 {
-				events = append(events, harness.Event{Type: harness.EventAssistant, Content: content, Images: images, TimestampMs: timestamp, Model: message.Model})
+				events = append(events, harness.Event{Type: harness.EventAssistant, Content: content, Images: images, TimestampMs: timestamp, Model: model, Reasoning: reasoning})
 			}
 		}
 	}

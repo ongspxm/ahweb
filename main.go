@@ -190,6 +190,7 @@ func main() {
 	mux.HandleFunc("/api/rewind", server.handleRewind)
 	mux.HandleFunc("/api/prompt", server.handlePrompt)
 	mux.HandleFunc("/api/cli", server.handleCLI)
+	mux.HandleFunc("/api/update", server.handleUpdate)
 	address := fmt.Sprintf("0.0.0.0:%d", *port)
 	log.Printf("ahweb listening on http://%s", address)
 	if err := http.ListenAndServe(address, mux); err != nil {

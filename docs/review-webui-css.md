@@ -2,18 +2,12 @@
 
 ## CSS-001: keep bulk CSS in web/index.html, grouped and compact
 
-Trigger: Keep styling centralized in `web/index.html` instead of scattering styles across JS or extra stylesheets.
-Group declarations under section headers, sort by logical groupings, and combine related properties onto single lines to minimize declarations.
-
-Verify: Check new styles live in `web/index.html` under the right section header and don't bloat into multi-line boilerplate.
-
-Severity: P3 if styles are scattered or unnecessarily verbose.
+Trigger: keep bulk CSS in "web/index.html", not scattered across JS or extra stylesheets -> group under section headers, sort logically, combine related properties onto single lines.
+Verify: check new styles sit in "web/index.html" under right section header without multi-line bloat.
+Severity: P3 if styles scattered or verbose.
 
 ## CSS-002: prefer Pico.css and Pico CSS variables over custom styling
 
-Trigger: Minimize custom CSS by leaning on `pico.css` defaults and styling.
-Use Pico CSS variables (`https://picocss.com/docs/css-variables#all-css-variables`) for colors and theming instead of hardcoded values.
-
-Verify: Check new UI elements use Pico semantics/variables before adding custom CSS rules.
-
-Severity: P3 if custom CSS duplicates Pico styling or hardcodes theme colors.
+Trigger: lean on "pico.css" defaults and Pico CSS variables ("https://picocss.com/docs/css-variables#all-css-variables") for colors/theming -> avoid custom CSS or hardcoded values.
+Verify: check new UI elements use Pico semantics/variables before adding custom rules.
+Severity: P3 if custom CSS duplicates Pico or hardcodes theme colors.

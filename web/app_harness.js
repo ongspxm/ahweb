@@ -121,6 +121,7 @@ const eleDir = $("#directory"),
 	eleImageInput = $("#prompt-images"),
 	eleImagePreview = $("#image-preview"),
 	eleModel = $("#model"),
+	eleModelDefaultStatus = $("#model-default-status"),
 	eleModelList = $("#model-list"), // used to support auto complete
 	eleReasoning = $("#reasoning"),
 	eleHarness = $("#harness"),
@@ -158,9 +159,17 @@ function clearQueuedPrompts() {
 }
 
 const notices = new Map();
+const noticeTimers = new Map();
 function setNotice(id, message) {
+	clearTimeout(noticeTimers.get(id));
 	if (message) notices.set(id, message);
 	else notices.delete(id);
+	if (message)
+		noticeTimers.set(
+			id,
+			setTimeout(() => setNotice(id, ""), 10000),
+		);
+	else noticeTimers.delete(id);
 	eleNoticeList.replaceChildren();
 	for (const [key, text] of notices) {
 		const item = document.createElement("article"),
@@ -539,6 +548,32 @@ function renderReasoningList(useSaved = false) {
 	eleReasoning.disabled = levels.length === 0;
 }
 
+function renderModelDefaultStatus() {
+	const harness = currentHarness();
+	const model = config[`${harness}_default_model`] || "";
+	const levels = models[harness]?.[eleModel.value.trim() || model] || [];
+	const savedReasoning = config[`${harness}_default_reasoning`] || "";
+	const message =
+		!model ||
+		!Object.hasOwn(models[harness] || {}, model) ||
+		(levels.length && !levels.includes(savedReasoning))
+			? "Pick model+reasoning, these will be saved as default."
+			: "";
+	eleModelDefaultStatus.hidden = !message;
+	eleModelDefaultStatus.textContent = message;
+}
+
+function needsDefaultSave(harness, model) {
+	const saved = config[`${harness}_default_model`] || "";
+	const levels = models[harness]?.[model] || [];
+	const reasoning = config[`${harness}_default_reasoning`] || "";
+	return (
+		!saved ||
+		!Object.hasOwn(models[harness] || {}, saved) ||
+		(levels.length > 0 && !levels.includes(reasoning))
+	);
+}
+
 function renderQueuedPrompts(queue, images = []) {
 	const text = typeof queue === "string" ? queue : "";
 	eleQueued.textContent = text;
@@ -558,9 +593,30 @@ function renderEvents(list) {
 		}
 	}
 	function _messageMeta(e) {
-		return [localISO(Number(e.timestamp)), e.model || ""]
+		return [localISO(Number(e.timestamp)), e.model || "", e.reasoning || ""]
 			.filter(Boolean)
 			.join(" · ");
+	}
+	function _copyButton(getText, title = "Copy message") {
+		const button = document.createElement("button");
+		button.className = "outline";
+		button.type = "button";
+		button.title = title;
+		button.setAttribute("aria-label", title);
+		button.innerHTML = '<i data-lucide="copy"></i>';
+		button.addEventListener("click", async () => {
+			const text = getText();
+			try {
+				await navigator.clipboard.writeText(text);
+				setNotice(
+					"copied",
+					`copied: ${Array.from(text).slice(0, 140).join("")}…`,
+				);
+			} catch {
+				setError("Could not copy message");
+			}
+		});
+		return button;
 	}
 
 	function _card(role, meta, rewindID = "", copyText = "") {
@@ -586,27 +642,10 @@ function renderEvents(list) {
 		small.textContent = meta || "";
 		label.append(strong, document.createTextNode(" "), small);
 		h.append(label);
-		if (role === "YOU") {
+		if (role === "YOU" || role === "ASSISTANT") {
 			const actions = document.createElement("div");
 			actions.className = "message-actions";
-			const button = document.createElement("button");
-			button.className = "outline";
-			button.type = "button";
-			button.title = "Copy message";
-			button.setAttribute("aria-label", button.title);
-			button.innerHTML = '<i data-lucide="copy"></i>';
-			button.addEventListener("click", async () => {
-				try {
-					await navigator.clipboard.writeText(copyText);
-					setNotice(
-						"copied",
-						`copied: ${Array.from(copyText).slice(0, 140).join("")}…`,
-					);
-				} catch {
-					setError("Could not copy message");
-				}
-			});
-			actions.append(button);
+			actions.append(_copyButton(() => copyText));
 			if (rewindID) {
 				const rewind = document.createElement("button");
 				rewind.className = "outline";
@@ -670,6 +709,10 @@ function renderEvents(list) {
 		const det = document.createElement("details");
 		const pre = document.createElement("pre");
 		pre.textContent = detail;
+		const actions = document.createElement("span");
+		actions.className = "message-actions tool-actions";
+		actions.append(_copyButton(() => pre.textContent, "Copy tool content"));
+		row.append(actions);
 		det.append(row, pre);
 		li.append(det);
 		eventsList.append(li);
@@ -772,7 +815,7 @@ function renderEvents(list) {
 			_thinking(e);
 		} else if (e.type === "assistant") {
 			_closeEvents();
-			const b = _card("ASSISTANT", _messageMeta(e));
+			const b = _card("ASSISTANT", _messageMeta(e), "", e.content || "");
 			b.innerHTML = micromark(e.content || "", {
 				extensions: [gfm()],
 				htmlExtensions: [gfmHtml()],
@@ -839,11 +882,28 @@ function renderBusy(busy) {
 	eleChatStatus.hidden = !busy;
 }
 
-function renderHarnessDetails() {
+function renderHarnessDetails(events = []) {
 	const harness = currentHarness();
-	eleModel.value = config[`${harness}_default_model`] || "";
+	const chat = chatInfo(folder, sessid);
+	let model = config[`${harness}_default_model`] || "";
+	let reasoning = config[`${harness}_default_reasoning`] || "";
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i];
+		if (event?.type !== "assistant" && event?.type !== "thinking") continue;
+		model = event.model || model;
+		reasoning = event.reasoning || reasoning;
+		break;
+	}
+	if (chat?.busy) {
+		model = chat.promptModel ?? model;
+		reasoning = chat.promptReasoning ?? reasoning;
+	}
+	eleModel.value = model;
 	renderModelList();
 	renderReasoningList(true);
+	renderModelDefaultStatus();
+	if ([...eleReasoning.options].some((option) => option.value === reasoning))
+		eleReasoning.value = reasoning;
 }
 
 function renderReset() {
@@ -1051,29 +1111,32 @@ function apiLoadConfig(harnesses) {
 		.catch((err) => setError(err.message));
 }
 
-async function apiSaveModelSetting() {
-	const value = eleModel.value.trim();
-	const key = `${currentHarness()}_default_model`;
-	try {
-		const params = new URLSearchParams({ key, value });
-		const r = await fetch(`/api/config?${params}`, { method: "POST" });
-		const saved = await r.json();
-		if (!r.ok) throw new Error(saved.error || "Could not save config");
-		config[key] = typeof saved === "string" ? saved : value;
-	} catch (err) {
-		setError(err.message);
-	}
+async function apiWriteDefaults(harness, model, reasoning) {
+	const settings = {
+		[`${harness}_default_model`]: model,
+		[`${harness}_default_reasoning`]: reasoning,
+	};
+	const saved = await Promise.all(
+		Object.entries(settings).map(async ([key, value]) => {
+			const params = new URLSearchParams({ key, value });
+			const r = await fetch(`/api/config?${params}`, { method: "POST" });
+			const body = await r.json();
+			if (!r.ok) throw new Error(body.error || "Could not save config");
+			return [key, typeof body === "string" ? body : value];
+		}),
+	);
+	for (const [key, value] of saved) config[key] = value;
+	renderModelDefaultStatus();
 }
 
-async function apiSaveReasoningSetting() {
-	const value = eleReasoning.value;
-	const key = `${currentHarness()}_default_reasoning`;
+async function apiSaveDefaults() {
 	try {
-		const params = new URLSearchParams({ key, value });
-		const r = await fetch(`/api/config?${params}`, { method: "POST" });
-		const saved = await r.json();
-		if (!r.ok) throw new Error(saved.error || "Could not save config");
-		config[key] = typeof saved === "string" ? saved : value;
+		await apiWriteDefaults(
+			currentHarness(),
+			eleModel.value.trim(),
+			eleReasoning.value,
+		);
+		setError("");
 	} catch (err) {
 		setError(err.message);
 	}
@@ -1338,7 +1401,7 @@ function apiLoadSess(f, id) {
 		eleHarness.disabled = false;
 		eleChat.removeAttribute("hx-get");
 	}
-	renderHarnessDetails();
+	renderHarnessDetails(chatInfo(folder, id)?.events || []);
 	htmx.process(eleChat);
 	for (const button of eleSess.querySelectorAll("button[data-sessid]"))
 		button.classList.toggle("outline", button.dataset.sessid !== id);
@@ -1437,6 +1500,8 @@ document.body.addEventListener("htmx:afterRequest", (e) => {
 			sessid: responseSession,
 			resetEvents: Number(q.start_from) === -1,
 		});
+		if (responseFolder === folder && responseSession === sessid)
+			renderHarnessDetails(chat.events);
 		if (responseFolder === folder && responseSession === sessid)
 			startPollSess(responseFolder, responseSession);
 		if (responseFolder !== folder || responseSession !== sessid) return;
@@ -1551,10 +1616,10 @@ elePrompt.addEventListener("keydown", (e) => {
 eleModel.addEventListener("input", () => {
 	renderModelList();
 	renderReasoningList();
+	renderModelDefaultStatus();
 });
 $("#add-image").addEventListener("click", () => eleImageInput.click());
-eleModel.addEventListener("change", apiSaveModelSetting);
-eleReasoning.addEventListener("change", apiSaveReasoningSetting);
+$("#save-defaults").addEventListener("click", apiSaveDefaults);
 eleHarness.addEventListener("change", renderHarnessDetails);
 
 // chunk for UI for image for prompts
@@ -1626,10 +1691,14 @@ $("#prompt-form").addEventListener("submit", async (e) => {
 	folder = eleDir.value.trim();
 	if (!msg || !folder) return;
 	const model = eleModel.value.trim();
+	const reasoning = eleReasoning.value;
 	if (model && !Object.hasOwn(models[currentHarness()] || {}, model)) {
 		setError("Unknown model \u2013 pick from list or clear for Default");
 		return;
 	}
+	const harness = sessid
+		? chatInfo(folder, sessid)?.harness || "pi"
+		: currentHarness();
 	setError("");
 	const send = $("#send"),
 		sendIcon = send.innerHTML;
@@ -1649,18 +1718,28 @@ $("#prompt-form").addEventListener("submit", async (e) => {
 				prompt: msg,
 				images: promptImages.map(({ uri }) => uri),
 				model,
-				reasoning: eleReasoning.value,
-				harness: sessid
-					? chatInfo(folder, sessid)?.harness || "pi"
-					: currentHarness(),
+				reasoning,
+				harness,
 			}),
 		});
 		const b = await r.json();
 		if (!r.ok) throw new Error(b.error || "Request failed");
+		if (model && needsDefaultSave(harness, model)) {
+			try {
+				await apiWriteDefaults(harness, model, reasoning);
+			} catch (err) {
+				setError(`Prompt sent, but could not save defaults: ${err.message}`);
+			}
+		}
 		promptImages = [];
 		eleImagePreview.replaceChildren();
 		eleImagePreview.hidden = true;
-		const chat = updateChat(folder, { ...b, busy: true });
+		const chat = updateChat(folder, {
+			...b,
+			busy: true,
+			promptModel: model,
+			promptReasoning: reasoning,
+		});
 		renderBusy(chat.busy);
 		renderQueuedPrompts(chat.queued, chat.queued_images || []);
 		if (isNew) {

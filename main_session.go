@@ -77,6 +77,9 @@ func (a *app) listFolderSessions(folder string) error {
 				}
 				existing.LastTimestampMs = s.LastTimestampMs
 				existing.ParentSessID = s.ParentSessID
+				if s.ReadOnly {
+					existing.ReadOnly = true
+				}
 				existing.Mu.Unlock()
 			} else {
 				a.sessions[folder][key] = &harness.Session{SessionLite: s}
@@ -203,8 +206,8 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	busy := s.GetIsBusy()
 	s.Mu.Lock()
+	busy := s.GetIsBusyLocked()
 	tstamp := s.LastTimestampMs
 	type apiEvent struct {
 		harness.Event
@@ -286,8 +289,9 @@ func (a *app) handleRewind(w http.ResponseWriter, r *http.Request) {
 	result, done := make(chan error, 1), &sync.WaitGroup{}
 	done.Add(1)
 	select {
-	case a.pollJobs <- pollJob{session: s, done: done, rewindResult: result, rewindID: rewindID}:
+	case a.pollJobs <- pollJob{session: s, pollJobsDone: done, rewindResult: result, rewindTargetMsgID: rewindID}:
 	case <-r.Context().Done():
+		done.Done()
 		s.Mu.Lock()
 		s.IsRewinding = false
 		s.Mu.Unlock()
@@ -439,8 +443,7 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	maxImageBytes, maxPromptImages := int64(a.config.MaxImageMB)*(1<<20), a.config.MaxPromptImages
 	a.mu.Unlock()
-	limit := int64(maxPromptImages)*(maxImageBytes*4/3+256) + 1<<20
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxPromptImages)*(maxImageBytes*4/3+256)+1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
@@ -460,7 +463,6 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, uri := range req.Images {
-		// the parsing here is just for validation
 		img, err := harness.ParseImage(uri)
 		if err != nil {
 			apiWriteError(w, http.StatusBadRequest, "invalid image")
@@ -542,6 +544,16 @@ func (a *app) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	if s.IsDeleted || s.IsDeleting || s.IsStopping || s.IsRewinding {
 		s.Mu.Unlock()
 		apiWriteError(w, http.StatusConflict, "session is being deleted, stopped, or rewound")
+		return
+	}
+	if s.ReadOnly {
+		parentID := s.ParentSessID
+		s.Mu.Unlock()
+		msg := "session is read-only and does not accept direct messages"
+		if parentID != "" {
+			msg += "; prompt its parent session instead"
+		}
+		apiWriteError(w, http.StatusConflict, msg)
 		return
 	}
 	if s.QueuedMsg != "" && strings.TrimSpace(req.Prompt) != "" {

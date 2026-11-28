@@ -1,9 +1,12 @@
 package codex
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -39,7 +42,7 @@ type itemEventRef struct {
 type SessionConn struct {
 	mu                 sync.Mutex
 	harnessID          string
-	codexTurnID        string
+	activeTurn         struct{ id, model, reasoning string }
 	isWriter           bool
 	firstMetadataErrAt time.Time
 	usage              tokenUsage
@@ -90,10 +93,10 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 			if item.Model == "" {
 				continue
 			}
-			model := harness.Model{Harness: "codex", ID: "codex/" + item.Model}
-			for _, effort := range item.Supported {
-				if effort.Reasoning != "" {
-					model.Reasoning = append(model.Reasoning, effort.Reasoning)
+			model := harness.Model{Harness: "codex", ID: item.Model}
+			for _, supported := range item.Supported {
+				if supported.Reasoning != "" {
+					model.Reasoning = append(model.Reasoning, supported.Reasoning)
 				}
 			}
 			models[model.ID] = model
@@ -110,15 +113,22 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 	if err := ensureRPC(); err != nil {
 		return nil, err
 	}
+	cacheMu.Lock()
+	mappedSessions := make(map[string]string, len(harnessIDToSessID[realFolder]))
+	for harnessID, sessID := range harnessIDToSessID[realFolder] {
+		mappedSessions[harnessID] = sessID
+	}
+	cacheMu.Unlock()
 
 	type harnessSession struct {
-		ID            string          `json:"id"`
-		Preview       string          `json:"preview"`
-		Name          string          `json:"name"`
-		AgentNickname string          `json:"agentNickname"`
-		UpdatedAt     int64           `json:"updatedAt"`
-		ParentID      string          `json:"parentThreadId"`
-		Source        json.RawMessage `json:"source"`
+		ID                   string          `json:"id"`
+		Preview              string          `json:"preview"`
+		Name                 string          `json:"name"`
+		AgentNickname        string          `json:"agentNickname"`
+		UpdatedAt            int64           `json:"updatedAt"`
+		ParentID             string          `json:"parentThreadId"`
+		CanAcceptDirectInput *bool           `json:"canAcceptDirectInput"`
+		Source               json.RawMessage `json:"source"`
 	}
 	_listSessions := func(baseParams map[string]any) ([]harnessSession, error) {
 		var sessions []harnessSession
@@ -164,14 +174,14 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		spawn := source.SubAgent.ThreadSpawn
 
 		id := hs.ID
-		if local := harnessIDToSessID[realFolder][hs.ID]; local != "" {
+		if local := mappedSessions[hs.ID]; local != "" {
 			id = local
 		}
 		parentID := hs.ParentID
 		if parentID == "" {
 			parentID = spawn.ParentThreadID
 		}
-		if local := harnessIDToSessID[realFolder][parentID]; local != "" {
+		if local := mappedSessions[parentID]; local != "" {
 			parentID = local
 		}
 
@@ -198,6 +208,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 			ID: id, RealPath: realFolder, Harness: "codex",
 			FirstUserMsg: firstUserMsg, LastTimestampMs: hs.UpdatedAt * 1000,
 			ParentSessID: parentID,
+			ReadOnly:     parentID != "" || hs.CanAcceptDirectInput != nil && !*hs.CanAcceptDirectInput,
 		}
 	}
 
@@ -217,7 +228,7 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 		seen[hs.ID] = true
 		sessions = append(sessions, _toSessionLite(hs))
 	}
-	for harnessID := range harnessIDToSessID[realFolder] {
+	for harnessID := range mappedSessions {
 		rootIDs = append(rootIDs, harnessID)
 	}
 	rootSeen := make(map[string]bool, len(rootIDs))
@@ -245,24 +256,17 @@ func (*Adapter) ListSessions(realFolder string) ([]harness.SessionLite, error) {
 
 func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	s.Mu.Lock()
-	id := s.ID
+	id, needsFirstPrompt := s.ID, s.NeedsFirstPrompt
 	s.Mu.Unlock()
 
-	// its kinda like a hacky to tell if the id is localID or codexID
-	isLocal := len(id) == 32
-	for _, r := range id {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
-			isLocal = false
-			break
-		}
-	}
-
+	// Use session state to distinguish local IDs from native thread IDs.
 	// early return if possible
 	cacheMu.Lock()
 	cached := conns[s.RealPath][id]
-	threadID := id
-	if isLocal {
-		threadID = sessIDToHarnessID[s.RealPath][id]
+	threadID := sessIDToHarnessID[s.RealPath][id]
+	isLocal := threadID != "" || needsFirstPrompt
+	if !isLocal {
+		threadID = id
 	}
 	cacheMu.Unlock()
 	// History refreshes must not resume a healthy, possibly unsaved thread.
@@ -282,7 +286,10 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	}
 	c := &SessionConn{eventRefs: map[string]itemEventRef{}}
 	method := "thread/start"
-	params := map[string]any{"cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}
+	params := map[string]any{
+		"cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access",
+		"config": map[string]any{"model_reasoning_summary": "detailed"},
+	}
 	if threadID != "" {
 		method = "thread/read"
 		params = map[string]any{"threadId": threadID}
@@ -295,7 +302,8 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	// init all the cache and pointer maps
 	var result struct {
 		Thread struct {
-			ID string `json:"id"`
+			ID                   string `json:"id"`
+			CanAcceptDirectInput *bool  `json:"canAcceptDirectInput"`
 		} `json:"thread"`
 	}
 	if err := decode(raw, &result); err != nil {
@@ -304,6 +312,13 @@ func (a *Adapter) Connect(s *harness.Session, _ bool) error {
 	if result.Thread.ID == "" {
 		return errors.New("Codex returned no thread ID")
 	}
+	s.Mu.Lock()
+	if s.ParentSessID != "" {
+		s.ReadOnly = true
+	} else if result.Thread.CanAcceptDirectInput != nil {
+		s.ReadOnly = !*result.Thread.CanAcceptDirectInput
+	}
+	s.Mu.Unlock()
 	c.mu.Lock()
 	c.harnessID = result.Thread.ID
 	c.isWriter = method == "thread/start"
@@ -435,13 +450,23 @@ func (a *Adapter) Rewind(s *harness.Session, rewindID string) error {
 // === session fns
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
+	s.Mu.Lock()
+	prompt, imgs, model, reasoning, busy := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning, s.BusyCli
+	s.BusyCli = true
+	s.Mu.Unlock()
+	if busy {
+		model, reasoning = nil, ""
+	}
 	c, err := a.sessionConn(s)
 	if err != nil {
 		return err
 	}
 	s.Mu.Lock()
-	prompt, imgs, model, effort := s.SendingMsg, append([]string(nil), s.SendingImages...), s.PromptModel, s.PromptReasoning
+	readOnly := s.ReadOnly
 	s.Mu.Unlock()
+	if readOnly {
+		return fmt.Errorf("%w: Codex sub-agent sessions do not accept direct input; prompt the parent session instead", harness.ErrPromptRejected)
+	}
 
 	input := make([]any, 0, len(imgs)+1)
 	if prompt != "" {
@@ -457,10 +482,22 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	threadID, isWriter := c.harnessID, c.isWriter
 	c.mu.Unlock()
 
+	_rejectIfSubagentErr := func(err error) error {
+		msg := err.Error()
+		if strings.Contains(msg, "direct app-server input is not allowed") ||
+			strings.Contains(msg, "multi-agent v2") && strings.Contains(msg, "cannot resume") {
+			s.Mu.Lock()
+			s.ReadOnly = true
+			s.Mu.Unlock()
+			return fmt.Errorf("%w: Codex sub-agent sessions do not accept direct input; prompt the parent session instead (%v)", harness.ErrPromptRejected, err)
+		}
+		return err
+	}
+
 	// swap the connection to write (if needed)
 	if !isWriter {
 		if _, _, err := connRPC0.call("thread/resume", map[string]any{"threadId": threadID, "cwd": s.RealPath, "approvalPolicy": "never", "sandbox": "danger-full-access"}); err != nil {
-			return err
+			return _rejectIfSubagentErr(err)
 		}
 		c.mu.Lock()
 		c.isWriter = true
@@ -470,14 +507,14 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	// form the args and send it out
 	params := map[string]any{"threadId": threadID, "input": input, "cwd": s.RealPath}
 	if model != nil {
-		params["model"] = strings.TrimPrefix(model.ID, "codex/")
+		params["model"] = model.ID
 	}
-	if effort != "" {
-		params["effort"] = effort
+	if reasoning != "" {
+		params["effort"] = reasoning
 	}
 	raw, _, err := connRPC0.call("turn/start", params)
 	if err != nil {
-		return err
+		return _rejectIfSubagentErr(err)
 	}
 	var result struct {
 		Turn struct {
@@ -488,15 +525,17 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		return err
 	}
 
-	// setting all the updated fields
 	c.mu.Lock()
-	c.codexTurnID, c.errors = result.Turn.ID, nil
+	c.activeTurn.id, c.activeTurn.model, c.activeTurn.reasoning = result.Turn.ID, "", reasoning
+	if model != nil {
+		c.activeTurn.model = model.ID
+	}
+	c.errors = nil
 	c.mu.Unlock()
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
 	return nil
 }
+
+func (*Adapter) CanSteer(bool) bool { return true }
 
 func (a *Adapter) Stop(s *harness.Session) error {
 	c, err := a.sessionConn(s)
@@ -504,7 +543,7 @@ func (a *Adapter) Stop(s *harness.Session) error {
 		return nil
 	}
 	c.mu.Lock()
-	turn := c.codexTurnID
+	turn := c.activeTurn.id
 	c.mu.Unlock()
 	if turn == "" {
 		return nil
@@ -621,9 +660,22 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		return prompt, ids
 	}
 
-	_convert := func(item map[string]any, timestamp int64, turnID string) []harness.Event {
+	type eventMetadata struct {
+		model     string
+		reasoning string
+	}
+	historyMetadata := make(map[string]eventMetadata)
+	_convert := func(item map[string]any, timestamp int64, turnID string, metadata eventMetadata) []harness.Event {
 		typeName, _ := item["type"].(string)
 		content := _itemText(item)
+		if model, _ := item["model"].(string); model != "" {
+			metadata.model = model
+		}
+		if reasoning, _ := item["effort"].(string); reasoning != "" {
+			metadata.reasoning = reasoning
+		} else if reasoning, _ := item["reasoningEffort"].(string); reasoning != "" {
+			metadata.reasoning = reasoning
+		}
 		switch typeName {
 		case "userMessage":
 			var images []string
@@ -638,11 +690,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			}
 			return []harness.Event{{Type: harness.EventUser, Content: content, Images: images, TimestampMs: timestamp, RewindID: turnID}}
 		case "agentMessage":
-			return []harness.Event{{Type: harness.EventAssistant, Content: content, TimestampMs: timestamp}}
+			return []harness.Event{{Type: harness.EventAssistant, Content: content, TimestampMs: timestamp, Model: metadata.model, Reasoning: metadata.reasoning}}
 		case "ContextCompaction", "contextCompaction", "compacted":
-			return []harness.Event{{Type: harness.EventAssistant, Content: "Context compacted.", TimestampMs: timestamp}}
+			return []harness.Event{{Type: harness.EventAssistant, Content: "Context compacted.", TimestampMs: timestamp, Model: metadata.model, Reasoning: metadata.reasoning}}
 		case "reasoning":
-			return []harness.Event{{Type: harness.EventThinking, Content: content, TimestampMs: timestamp}}
+			return []harness.Event{{Type: harness.EventThinking, Content: content, TimestampMs: timestamp, Model: metadata.model, Reasoning: metadata.reasoning}}
 		case "commandExecution":
 			id, _ := item["id"].(string)
 			cmd, _ := item["command"].(string)
@@ -786,7 +838,15 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			return
 		}
 		_rememberChildPrompt(item)
-		next := _convert(item, timestamp, turnID)
+		metadata, ok := historyMetadata[turnID]
+		if !ok {
+			c.mu.Lock()
+			if c.activeTurn.id == turnID {
+				metadata = eventMetadata{model: c.activeTurn.model, reasoning: c.activeTurn.reasoning}
+			}
+			c.mu.Unlock()
+		}
+		next := _convert(item, timestamp, turnID, metadata)
 		ref, exists := c.eventRefs[id]
 		if exists && ref.completed && !completed {
 			return
@@ -872,7 +932,9 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			c.mu.Unlock()
 		case "turn/started":
 			c.mu.Lock()
-			c.codexTurnID = params.Turn.ID
+			if c.activeTurn.id != params.Turn.ID {
+				c.activeTurn.id, c.activeTurn.model, c.activeTurn.reasoning = params.Turn.ID, "", ""
+			}
 			c.mu.Unlock()
 			if afterSnapshot {
 				eventBusy, eventBusyKnown = true, true
@@ -888,7 +950,9 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				}
 			}
 			c.mu.Lock()
-			c.codexTurnID = ""
+			if c.activeTurn.id == params.Turn.ID {
+				c.activeTurn.id, c.activeTurn.model, c.activeTurn.reasoning = "", "", ""
+			}
 			c.mu.Unlock()
 		case "item/started", "item/completed":
 			if includeItemEvents && (method == "item/completed" || params.Item["type"] != "agentMessage") {
@@ -931,7 +995,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			expired := time.Since(c.firstMetadataErrAt) >= 30*time.Second
 			if expired {
 				c.firstMetadataErrAt = time.Time{}
-				c.codexTurnID = ""
+				c.activeTurn.id, c.activeTurn.model, c.activeTurn.reasoning = "", "", ""
 			}
 
 			c.mu.Unlock()
@@ -950,15 +1014,52 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	c.mu.Unlock()
 	var result struct {
 		Thread struct {
-			UpdatedAt      int64  `json:"updatedAt"`
-			ParentThreadID string `json:"parentThreadId"`
-			Status         struct {
+			UpdatedAt            int64  `json:"updatedAt"`
+			ParentThreadID       string `json:"parentThreadId"`
+			Path                 string `json:"path"`
+			CanAcceptDirectInput *bool  `json:"canAcceptDirectInput"`
+			Status               struct {
 				Type string `json:"type"`
 			} `json:"status"`
 		} `json:"thread"`
 	}
 	if err := decode(raw, &result); err != nil {
 		return err
+	}
+	if full && result.Thread.Path != "" {
+		file, err := os.Open(result.Thread.Path)
+		if err != nil {
+			log.Printf("adapter.codex: could not read rollout metadata: %v", err)
+		} else {
+			scanner := bufio.NewScanner(file)
+			scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+			for scanner.Scan() {
+				var row struct {
+					Type    string `json:"type"`
+					Payload struct {
+						TurnID string `json:"turn_id"`
+						Model  string `json:"model"`
+						Effort string `json:"effort"`
+					} `json:"payload"`
+				}
+				if json.Unmarshal(scanner.Bytes(), &row) != nil || row.Type != "turn_context" {
+					continue
+				}
+				metadata := eventMetadata{
+					model:     row.Payload.Model,
+					reasoning: row.Payload.Effort,
+				}
+				if row.Payload.TurnID != "" {
+					historyMetadata[row.Payload.TurnID] = metadata
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				log.Printf("adapter.codex: could not scan rollout metadata: %v", err)
+			}
+			if err := file.Close(); err != nil {
+				log.Printf("adapter.codex: could not close rollout metadata: %v", err)
+			}
+		}
 	}
 
 	// child prompt lookup
@@ -1015,11 +1116,12 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 
 	if full {
-		var turns []struct {
+		type codexTurn struct {
 			ID        string           `json:"id"`
 			StartedAt int64            `json:"startedAt"`
 			Items     []map[string]any `json:"items"`
 		}
+		var turns []codexTurn
 		cursor := ""
 		for {
 			params := map[string]any{"threadId": threadID, "limit": 100, "sortDirection": "asc", "itemsView": "full"}
@@ -1035,12 +1137,8 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				return err
 			}
 			var page struct {
-				Data []struct {
-					ID        string           `json:"id"`
-					StartedAt int64            `json:"startedAt"`
-					Items     []map[string]any `json:"items"`
-				} `json:"data"`
-				NextCursor *string `json:"nextCursor"`
+				Data       []codexTurn `json:"data"`
+				NextCursor *string     `json:"nextCursor"`
 			}
 			if err := decode(pageRaw, &page); err != nil {
 				return err
@@ -1058,6 +1156,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		firstUser := ""
 		lastTurn := len(turns) - 1
 		for ti, turn := range turns {
+			metadata := historyMetadata[turn.ID]
 			for ii, item := range turn.Items {
 				_rememberChildPrompt(item)
 				status, _ := item["status"].(string)
@@ -1067,7 +1166,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 				}
 				id, _ := item["id"].(string)
 				timestamp := turn.StartedAt * 1000
-				converted := _convert(item, timestamp, turn.ID)
+				converted := _convert(item, timestamp, turn.ID, metadata)
 				indices := make([]int, 0, len(converted))
 				for _, event := range converted {
 					indices = append(indices, len(events))
@@ -1126,7 +1225,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	pendingErrors := c.errors
 	c.errors = nil
 	usage := c.usage
-	activeTurn := c.codexTurnID != ""
+	activeTurn := c.activeTurn.id != ""
 	c.mu.Unlock()
 	busy := result.Thread.Status.Type == "active" || activeTurn
 	if eventBusyKnown {
@@ -1134,7 +1233,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	}
 	if !busy {
 		c.mu.Lock()
-		c.codexTurnID = ""
+		c.activeTurn.id, c.activeTurn.model, c.activeTurn.reasoning = "", "", ""
 		c.mu.Unlock()
 	}
 
@@ -1163,6 +1262,11 @@ func (a *Adapter) Poll(s *harness.Session) error {
 	s.BusyCli = busy
 	s.DoFullHistory = false
 	s.LastTimestampMs = result.Thread.UpdatedAt * 1000
+	if s.ParentSessID != "" {
+		s.ReadOnly = true
+	} else if result.Thread.CanAcceptDirectInput != nil {
+		s.ReadOnly = !*result.Thread.CanAcceptDirectInput
+	}
 	s.FullInputToken, s.FullOutputToken = usage.Total.InputTokens, usage.Total.OutputTokens
 	s.CacheReadToken, s.CacheWriteToken = usage.Total.CachedInputTokens, usage.Total.CacheWriteInputTokens
 	s.ContextTokens, s.ContextWindow = usage.Last.TotalTokens, usage.ModelContextWindow

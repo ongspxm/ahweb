@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ongspxm/ahweb/harness"
+	"github.com/ongspxm/ahweb/internal/processgroup"
 )
 
 type connStruct struct {
@@ -32,13 +33,16 @@ type piEntry struct {
 	Type      string  `json:"type"`
 	Timestamp string  `json:"timestamp"`
 	Message   struct {
-		Role         string          `json:"role"`
-		ErrorMessage string          `json:"errorMessage"`
-		Content      json.RawMessage `json:"content"`
-		Model        string          `json:"model"`
-		ToolCallID   string          `json:"toolCallId"`
-		ToolName     string          `json:"toolName"`
-		IsError      bool            `json:"isError"`
+		Role          string          `json:"role"`
+		ErrorMessage  string          `json:"errorMessage"`
+		Content       json.RawMessage `json:"content"`
+		Provider      string          `json:"provider"`
+		Model         string          `json:"model"`
+		ThinkingLevel string          `json:"thinkingLevel"`
+		Effort        string          `json:"effort"`
+		ToolCallID    string          `json:"toolCallId"`
+		ToolName      string          `json:"toolName"`
+		IsError       bool            `json:"isError"`
 	} `json:"message"`
 }
 
@@ -71,17 +75,15 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 		return nil, fmt.Errorf("could not open Pi output: %w", err)
 	}
 	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := processgroup.Start(cmd); err != nil {
 		return nil, fmt.Errorf("could not start Pi: %w", err)
 	}
 	defer func() {
 		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = processgroup.Kill(cmd)
 		_ = cmd.Wait()
 	}()
-	timer := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
+	timer := time.AfterFunc(30*time.Second, func() { _ = processgroup.Kill(cmd) })
 	defer timer.Stop()
 	if _, err := io.WriteString(stdin, `{"id":"models","type":"get_available_models"}`+"\n"); err != nil {
 		return nil, fmt.Errorf("could not ask Pi for models: %w", err)
@@ -114,7 +116,7 @@ func (*Adapter) GetModels() (map[string]harness.Model, error) {
 			entry := harness.Model{Harness: "pi", ID: modelID}
 			if model.Reasoning {
 				for _, level := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
-					if effort, ok := model.ThinkingLevelMap[level]; ok && effort != nil {
+					if reasoning, ok := model.ThinkingLevelMap[level]; ok && reasoning != nil {
 						entry.Reasoning = append(entry.Reasoning, level)
 					}
 				}
@@ -231,7 +233,7 @@ func (*Adapter) CleanUp(s *harness.Session) error {
 	if conn.Cmd != nil {
 		_ = conn.Stdin.Close()
 		if conn.Cmd.ProcessState == nil {
-			_ = conn.Cmd.Process.Kill()
+			_ = processgroup.Kill(conn.Cmd)
 		}
 		_ = conn.Cmd.Wait()
 		conn.Cmd, conn.Stdin, conn.Stdout, conn.Decoder = nil, nil, nil, nil
@@ -297,7 +299,7 @@ func (a *Adapter) Connect(s *harness.Session, force bool) error {
 		return fmt.Errorf("could not open Pi output: %w", err)
 	}
 	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := processgroup.Start(cmd); err != nil {
 		_ = stdin.Close()
 		return fmt.Errorf("could not start Pi: %w", err)
 	}
@@ -415,9 +417,14 @@ func (a *Adapter) Delete(s *harness.Session) error {
 
 func (a *Adapter) SendPrompt(s *harness.Session) error {
 	s.Mu.Lock()
-	model, reasoning, prompt := s.PromptModel, s.PromptReasoning, s.SendingMsg
+	model, reasoning, prompt, busy := s.PromptModel, s.PromptReasoning, s.SendingMsg, s.BusyCli
 	images := append([]string(nil), s.SendingImages...)
+	s.BusyCli = true
 	s.Mu.Unlock()
+	behavior := ""
+	if busy {
+		model, reasoning, behavior = nil, "", "steer"
+	}
 	cacheMu.Lock()
 	conn := cacheConns[s.RealPath][s.ID]
 	cacheMu.Unlock()
@@ -453,6 +460,9 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 		}
 	}
 	command := map[string]any{"type": "prompt", "message": prompt}
+	if behavior != "" {
+		command["streamingBehavior"] = behavior
+	}
 	if len(images) > 0 {
 		parts := make([]harness.Image, 0, len(images))
 		for _, uri := range images {
@@ -467,12 +477,10 @@ func (a *Adapter) SendPrompt(s *harness.Session) error {
 	if err := send(command); err != nil {
 		return err
 	}
-	// Mark the session busy so the web UI will poll.
-	s.Mu.Lock()
-	s.BusyCli = true
-	s.Mu.Unlock()
 	return nil
 }
+
+func (*Adapter) CanSteer(bool) bool { return true }
 
 func (a *Adapter) Stop(s *harness.Session) error {
 	conn, err := a.conn(s)
@@ -569,6 +577,14 @@ func (a *Adapter) Poll(s *harness.Session) error {
 		if entry.Type != "message" {
 			continue
 		}
+		model := entry.Message.Model
+		if model != "" && entry.Message.Provider != "" && !strings.Contains(model, "/") {
+			model = entry.Message.Provider + "/" + model
+		}
+		reasoning := entry.Message.ThinkingLevel
+		if reasoning == "" {
+			reasoning = entry.Message.Effort
+		}
 		timestamp := int64(0)
 		if t, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
 			timestamp = t.UnixMilli()
@@ -597,7 +613,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 						}
 					case "thinking":
 						if text := strings.TrimSpace(part.Thinking); text != "" && entry.Message.Role == "assistant" {
-							events = append(events, harness.Event{Type: harness.EventThinking, Content: text, TimestampMs: timestamp, Model: entry.Message.Model})
+							events = append(events, harness.Event{Type: harness.EventThinking, Content: text, TimestampMs: timestamp, Model: model, Reasoning: reasoning})
 						}
 					case "toolCall":
 						var args string
@@ -632,7 +648,7 @@ func (a *Adapter) Poll(s *harness.Session) error {
 			if entry.Message.ErrorMessage != "" {
 				events = append(events, harness.Event{Type: harness.EventError, Content: "Model response failed: " + entry.Message.ErrorMessage, TimestampMs: timestamp})
 			} else if content = strings.TrimSpace(content); content != "" || len(images) > 0 {
-				events = append(events, harness.Event{Type: harness.EventAssistant, Content: content, Images: images, TimestampMs: timestamp, Model: entry.Message.Model})
+				events = append(events, harness.Event{Type: harness.EventAssistant, Content: content, Images: images, TimestampMs: timestamp, Model: model, Reasoning: reasoning})
 			}
 		}
 	}
